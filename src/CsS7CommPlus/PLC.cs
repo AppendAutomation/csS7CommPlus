@@ -289,6 +289,32 @@ namespace CsS7CommPlus
             catch (Exception e) { return list.Select(t => new Response(t, null, e.Message)).ToList(); }
         }
 
+        /// <summary>
+        /// Report which of these symbolic names the PLC does not know, so a caller
+        /// can warn about its own configuration before it starts collecting.
+        ///
+        /// The <see cref="Response.Value"/> is the list of unknown names, empty
+        /// when every one resolved.  A backend that cannot answer directly is
+        /// asked for its tag list instead, which only recognises the names the
+        /// browse advertises.
+        /// </summary>
+        public Response ResolveTags(IEnumerable<string> tags)
+        {
+            var list = tags.ToList();
+            var sess = EnsureV3(out var err);
+            if (err != null) return new Response(null, list, err);
+
+            try
+            {
+                if (sess is IV3SymbolResolver resolver)
+                    return new Response(null, resolver.Unresolved(list), 0x00);
+
+                var known = new HashSet<string>(sess!.Tags().Select(t => t.Name), StringComparer.Ordinal);
+                return new Response(null, list.Where(t => !known.Contains(t)).ToList(), 0x00);
+            }
+            catch (Exception e) { return new Response(null, list, e.Message); }
+        }
+
         // --- subscriptions (optional backend capability) -------------------
 
         /// <summary>

@@ -25,7 +25,7 @@ namespace CsS7CommPlus.V3
     /// needs a reconnect — which is also what the PLC's own layout change
     /// requires.
     /// </summary>
-    public class V3Backend : IV3Backend, IV3SubscriptionBackend, IV3AbortableBackend, IDisposable
+    public class V3Backend : IV3Backend, IV3SubscriptionBackend, IV3AbortableBackend, IV3SymbolResolver, IDisposable
     {
         private readonly S7CommPlusClient _client;
         private readonly Dictionary<uint, string> _subscribedByReference = new Dictionary<uint, string>();
@@ -111,6 +111,18 @@ namespace CsS7CommPlus.V3
             }
             _tags = list;
             return _tags;
+        }
+
+        /// <inheritdoc/>
+        public IList<string> Unresolved(IEnumerable<string> names)
+        {
+            var catalog = _client.TagCatalog;
+            var missing = new List<string>();
+            foreach (var name in names)
+            {
+                if (!catalog.TryResolve(name, out _)) missing.Add(name);
+            }
+            return missing;
         }
 
         /// <inheritdoc/>
