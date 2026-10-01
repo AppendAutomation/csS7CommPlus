@@ -119,6 +119,13 @@ namespace CsS7CommPlus.V3.Session
         /// <summary>Raised for each protocol-level diagnostic; wire to the host's logger.</summary>
         public event Action<string>? OnDiagnostic;
 
+        /// <summary>
+        /// Log every frame sent and received as hex through <see cref="OnDiagnostic"/>.
+        /// Siemens does not document this protocol, so when a CPU refuses a request
+        /// the frame bytes are the only way to see why; leave it off in production.
+        /// </summary>
+        public bool TraceFrames { get; set; }
+
         /// <summary>Create a connection for the given PLC.</summary>
         public S7CommPlusConnection(string host, int port = 102)
         {
@@ -444,7 +451,9 @@ namespace CsS7CommPlus.V3.Session
             frame.AddRange(framePayload);
             frame.AddRange(new byte[] { S7Protocol.ProtocolId, (byte)version, 0x00, 0x00 });
 
-            _transport.Send(frame.ToArray());
+            var bytes = frame.ToArray();
+            if (TraceFrames) Log($"send V{(int)version} {bytes.Length} bytes: {ToHex(bytes)}");
+            _transport.Send(bytes);
         }
 
         private byte[] ComputeDigest(byte[] data)
@@ -553,7 +562,9 @@ namespace CsS7CommPlus.V3.Session
                             $"Reassembled response exceeds its limits ({data.Count} bytes, {fragments} fragments)");
                 }
 
-                return data.ToArray();
+                var result = data.ToArray();
+                if (TraceFrames) Log($"recv V{(int)version} {result.Length} bytes: {ToHex(result)}");
+                return result;
             }
             finally
             {
