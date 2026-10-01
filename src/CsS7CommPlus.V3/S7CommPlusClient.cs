@@ -61,6 +61,16 @@ namespace CsS7CommPlus.V3
             set => _connection.TimeoutMs = value;
         }
 
+        /// <summary>
+        /// Which session authentication to use.  The default decides from the
+        /// PLC's own reply, which is what a driver facing a mixed site wants.
+        /// </summary>
+        public SessionMode Mode
+        {
+            get => _connection.Mode;
+            set => _connection.Mode = value;
+        }
+
         /// <summary>Raised for each protocol-level diagnostic; wire to the host's logger.</summary>
         public event Action<string>? OnDiagnostic
         {
@@ -358,13 +368,38 @@ namespace CsS7CommPlus.V3
             public uint Rid { get; set; }
         }
 
-        /// <summary>List the PLC's data blocks by exploring the PLC program object.</summary>
+        /// <summary>
+        /// List the PLC's data blocks.  A TLS session explores the PLC program
+        /// object and asks for the name and number attributes; a session-key CPU
+        /// wants the data-block wildcard address in the fixed layout TIA Portal
+        /// sends, which the VLQ form does not match.
+        /// </summary>
         public List<DataBlockInfo> ListDataBlocks()
         {
-            var payload = BuildExploreRequest(Ids.NativeThePlcProgramRid,
-                                              new[] { Ids.ObjectVariableTypeName, Ids.BlockBlockNumber });
+            var payload = _connection.SessionKeyActive
+                ? BuildExploreWildcardRequest(DataBlockWildcardAddress)
+                : BuildExploreRequest(Ids.NativeThePlcProgramRid,
+                                      new[] { Ids.ObjectVariableTypeName, Ids.BlockBlockNumber });
+
             var response = _connection.SendRequest(FunctionCode.Explore, payload, 5);
             return ParseExploreDataBlocks(response);
+        }
+
+        /// <summary>The address that matches every data block in an Explore request.</summary>
+        private const uint DataBlockWildcardAddress = 0x8A11FFFF;
+
+        /// <summary>
+        /// Build the Explore request a V1-initial CPU expects: a fixed-width
+        /// 32-bit object id followed by fixed parameters, rather than the VLQ form.
+        /// </summary>
+        internal static byte[] BuildExploreWildcardRequest(uint exploreId, byte sequence = 10)
+        {
+            var p = new List<byte>();
+            S7Codec.AppendUInt32(p, exploreId);
+            p.AddRange(new byte[] { 0x00, 0x01, 0x00, 0x01, 0x00, 0x00 });
+            p.Add(sequence);
+            p.AddRange(new byte[] { 0x00, 0x00, 0x00, 0x00, 0x00 });
+            return p.ToArray();
         }
 
         /// <summary>

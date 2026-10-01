@@ -1,40 +1,50 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Net.Security;
-using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Text;
-using System.Threading;
 using CsS7CommPlus.V3.Protocol;
+using CsS7CommPlus.V3.Transport;
 using HarpoS7.Tls;
 
 namespace CsS7CommPlus.V3.Session
 {
+    /// <summary>Which session authentication the PLC expects.</summary>
+    public enum SessionMode
+    {
+        /// <summary>Decide from the PLC's CreateObject reply; the default.</summary>
+        Automatic = 0,
+        /// <summary>Force the pre-TIA-V17 challenge scheme.</summary>
+        SessionKey = 1,
+        /// <summary>Force the TIA-V17+ TLS scheme.</summary>
+        Tls = 2,
+    }
+
     /// <summary>
-    /// An S7comm-plus session to one S7-1200/1500 CPU, carried inside TLS.
+    /// An S7comm-plus session to one S7-1200/1500 CPU.
     ///
-    /// The connect sequence is COTP connection request/confirm, the InitSSL
-    /// exchange, the TLS 1.2/1.3 handshake, a CreateObject that opens the
-    /// NullServerSession, and a V2 SetMultiVariables that echoes
-    /// ServerSessionVersion back.  From then on every request carries the V2
-    /// IntegrityId counters.
+    /// The protocol has two session variants and a CPU supports one of them,
+    /// decided by the TIA Portal version the project was made with:
     ///
-    /// TLS records travel as the payload of COTP data frames — the TPKT and COTP
-    /// headers stay in clear text, which is why the socket cannot simply be
-    /// wrapped in TLS.  HarpoS7's CotpStream provides that framing and its
-    /// <see cref="HarpoTlsAuth"/> drives the COTP and InitSSL handshake, so this
-    /// class starts from the authenticated <see cref="SslStream"/> it returns.
+    /// * **SessionKey** (TIA Portal V16 and earlier).  CreateObject goes out in
+    ///   clear text and the PLC answers with a 20-byte challenge and the
+    ///   fingerprint of the public key it expects.  The client solves the
+    ///   challenge, sends the result in the session-setup write, and every frame
+    ///   afterwards carries a keyed digest over its own bytes.
+    /// * **TLS** (TIA Portal V17 and later).  An InitSSL exchange is followed by a
+    ///   TLS handshake whose records travel inside COTP data frames, and the V2
+    ///   framing inside it needs no digest because TLS already protects it.
     ///
-    /// This covers PLCs configured with TIA Portal V17 or later (S7-1200 FW V4.3+,
-    /// S7-1500 FW V2.9+), which is the band that supports secure communication.
-    /// The pre-V17 challenge scheme — where frames carry a keyed digest instead of
-    /// travelling inside TLS — is not implemented here.
+    /// <see cref="SessionMode.Automatic"/> reads the CreateObject reply and picks:
+    /// a challenge and fingerprint mean SessionKey, their absence means the CPU
+    /// wanted TLS.  Either way the symbol browse, reads, writes and subscriptions
+    /// above this layer are identical.
     ///
     /// Ported from the MIT-licensed s7commplus Python backend (connection.py).
     /// A connection is driven by one caller at a time; requests are serialized
-    /// internally but notifications must not be awaited concurrently with a
-    /// request.
+    /// internally, but a notification must not be awaited while a request is in
+    /// flight.
     /// </summary>
     public class S7CommPlusConnection : IDisposable
     {
@@ -44,14 +54,31 @@ namespace CsS7CommPlus.V3.Session
         private const int MaxReassembledFragments = 4096;
         private const uint SystemEventReturnValueId = 40305;
 
+        /// <summary>The digest length a V3 frame declares ahead of its digest.</summary>
+        private const byte IntegrityDigestLength = 0x20;
+
+        /// <summary>Only the first 24 bytes of the session key key the digest.</summary>
+        private const int DigestKeyLength = 24;
+
         private readonly object _requestLock = new object();
         private readonly Queue<byte[]> _notificationFrames = new Queue<byte[]>();
 
-        private TcpClient? _tcp;
+        private IsoTcpConnection? _iso;
         private SslStream? _ssl;
+        private IPduTransport? _transport;
+
         private ushort _sequenceNumber;
         private bool _connected;
         private bool _sessionReady;
+
+        private byte[]? _serverSessionVersion;
+        private string? _publicKeyFingerprint;
+        private byte[]? _sessionChallenge;
+        private byte[]? _sessionKey;
+
+        private bool _withIntegrityId;
+        private uint _integrityIdRead;
+        private uint _integrityIdWrite;
 
         /// <summary>PLC IP address or host name.</summary>
         public string Host { get; }
@@ -62,7 +89,10 @@ namespace CsS7CommPlus.V3.Session
         /// <summary>Socket and request timeout in milliseconds.</summary>
         public int TimeoutMs { get; set; } = 5000;
 
-        /// <summary>The protocol version the session settled on (V2 inside TLS).</summary>
+        /// <summary>Which session authentication to use; automatic by default.</summary>
+        public SessionMode Mode { get; set; } = SessionMode.Automatic;
+
+        /// <summary>The protocol version the session settled on.</summary>
         public ProtocolVersion ProtocolVersion { get; private set; }
 
         /// <summary>Session id allocated by the PLC; the first CreateObject object id.</summary>
@@ -74,8 +104,17 @@ namespace CsS7CommPlus.V3.Session
         /// <summary>Whether the session is open and set up.</summary>
         public bool Connected => _connected;
 
+        /// <summary>Whether the session is protected by TLS rather than a keyed digest.</summary>
+        public bool TlsActive => _ssl != null;
+
+        /// <summary>Whether frames carry a keyed digest, i.e. the SessionKey variant is in use.</summary>
+        public bool SessionKeyActive => _sessionKey != null;
+
         /// <summary>The PLC's effective protection level, when it reported one.</summary>
         public int? ProtectionLevel { get; private set; }
+
+        /// <summary>The fingerprint of the public key the PLC asked for, when it named one.</summary>
+        public string? PublicKeyFingerprint => _publicKeyFingerprint;
 
         /// <summary>Raised for each protocol-level diagnostic; wire to the host's logger.</summary>
         public event Action<string>? OnDiagnostic;
@@ -92,72 +131,149 @@ namespace CsS7CommPlus.V3.Session
         // --- connect / disconnect ------------------------------------------
 
         /// <summary>
-        /// Open the socket, run the COTP, InitSSL and TLS handshakes, create the
-        /// session and complete session setup.
+        /// Open the socket, negotiate the session the PLC supports, and complete
+        /// session setup.
         /// </summary>
         public void Connect()
         {
             try
             {
-                _tcp = new TcpClient();
-                _tcp.NoDelay = true;                    // request/response traffic; Nagle only adds latency
-                if (!_tcp.ConnectAsync(Host, Port).Wait(TimeoutMs))
-                    throw new S7TimeoutException($"TCP connect to {Host}:{Port} timed out after {TimeoutMs} ms");
+                _iso = new IsoTcpConnection(Host, Port);
 
-                _tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                _tcp.ReceiveTimeout = TimeoutMs;
-                _tcp.SendTimeout = TimeoutMs;
-
-                var network = _tcp.GetStream();
-
-                // COTP connection request/confirm, InitSSL, then the TLS handshake.
-                // The PLC presents a self-signed per-device certificate, so the
-                // chain cannot be validated against a public root.
-                var authOptions = new SslClientAuthenticationOptions
+                if (Mode == SessionMode.Tls)
                 {
-                    TargetHost = Host,
-                    RemoteCertificateValidationCallback = (_, _, _, _) => true,
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                };
-
-                var authTask = HarpoTlsAuth.AuthenticateUsingTlsAsync(network, authOptions, "SIMATIC-ROOT-HMI");
-                if (!authTask.Wait(TimeoutMs))
-                    throw new S7TimeoutException($"TLS handshake with {Host} timed out after {TimeoutMs} ms");
-                _ssl = authTask.Result;
-                _ssl.ReadTimeout = TimeoutMs;
-                _ssl.WriteTimeout = TimeoutMs;
-                Log($"TLS activated ({_ssl.SslProtocol}, {_ssl.NegotiatedCipherSuite})");
+                    // HarpoS7 drives the COTP handshake, the InitSSL exchange and
+                    // the TLS handshake over the raw socket and hands back the
+                    // authenticated stream.
+                    _iso.OpenSocketOnly(TimeoutMs);
+                    ActivateTls(_iso.NetworkStream);
+                    _transport = new StreamPduTransport(_ssl!);
+                }
+                else
+                {
+                    _iso.Open(TimeoutMs);
+                    _transport = _iso;
+                    InitSsl();
+                }
 
                 CreateSession();
 
-                // Inside TLS the data PDUs are V2, whatever version CreateObject used.
-                ProtocolVersion = ProtocolVersion.V2;
+                bool wantsSessionKey = _sessionChallenge != null && _publicKeyFingerprint != null;
+
+                if (Mode == SessionMode.SessionKey && !wantsSessionKey)
+                    throw new S7AuthenticationException(
+                        "SessionKey authentication was requested but the PLC offered no challenge; " +
+                        "this CPU was configured with TIA Portal V17 or later and wants the TLS session");
+
+                if (Mode == SessionMode.Automatic && !wantsSessionKey && !TlsActive)
+                {
+                    // The CPU answered without a challenge, so it expects the TLS
+                    // session. Start again with TLS rather than guessing on.
+                    Log("PLC offered no session challenge; reconnecting with TLS");
+                    ResetState();
+                    _iso = new IsoTcpConnection(Host, Port);
+                    _iso.OpenSocketOnly(TimeoutMs);
+                    ActivateTls(_iso.NetworkStream);
+                    _transport = new StreamPduTransport(_ssl!);
+                    CreateSession();
+                    wantsSessionKey = false;
+                }
+
+                if (TlsActive)
+                {
+                    // Inside TLS the data PDUs are V2, whatever CreateObject used.
+                    ProtocolVersion = ProtocolVersion.V2;
+                }
 
                 if (_serverSessionVersion == null)
                     throw new S7ConnectionException(
                         "PLC did not return a ServerSessionVersion attribute; session setup cannot continue");
 
-                if (!SetupSession())
+                SessionKeyMaterial? material = null;
+                if (wantsSessionKey)
+                {
+                    material = SessionKeyAuth.Authenticate(_publicKeyFingerprint!, _sessionChallenge!);
+                    if (material == null)
+                        throw new S7AuthenticationException(
+                            $"PLC asked for public key {_publicKeyFingerprint}, which is not in the bundled key set");
+                    Log($"Session-key blob built for {_publicKeyFingerprint} ({material.Blob.Length} bytes)");
+                }
+
+                if (!SetupSession(material))
                     throw new S7ConnectionException("The PLC rejected S7comm-plus session setup");
 
                 _sessionReady = true;
 
-                // V2 tracks a read and a write IntegrityId counter per session.
-                _withIntegrityId = true;
-                _integrityIdRead = 0;
-                _integrityIdWrite = 0;
+                if (material != null)
+                {
+                    // From here every frame carries a keyed digest and the two
+                    // IntegrityId counters.
+                    _sessionKey = material.SessionKey;
+                    _withIntegrityId = true;
+                    _integrityIdRead = 0;
+                    _integrityIdWrite = 0;
+                    Log("Session key accepted; frame digests and IntegrityId tracking enabled");
+
+                    _connected = true;      // SendRequest needs the session to count as live
+                    ActivateSession();
+                }
+                else
+                {
+                    _withIntegrityId = true;
+                    _integrityIdRead = 0;
+                    _integrityIdWrite = 0;
+                    _connected = true;
+                }
 
                 ProtectionLevel = ReadEffectiveProtectionLevel();
                 if (ProtectionLevel != null) Log($"PLC reports protection level {ProtectionLevel}");
 
-                _connected = true;
-                Log($"Connected to {Host}:{Port}, version=V{(int)ProtocolVersion}, session=0x{SessionId:X8}");
+                Log($"Connected to {Host}:{Port}, V{(int)ProtocolVersion}, session=0x{SessionId:X8}, " +
+                    (TlsActive ? "TLS" : "session key"));
             }
             catch
             {
                 Disconnect();
                 throw;
             }
+        }
+
+        /// <summary>Run the InitSSL exchange, which precedes CreateObject on every CPU.</summary>
+        private void InitSsl()
+        {
+            ushort seq = NextSequenceNumber();
+
+            var r = new List<byte>();
+            r.AddRange(S7Codec.EncodeRequestHeader((ushort)FunctionCode.InitSsl, seq, 0, 0x30));
+            S7Codec.AppendUInt32(r, 0);
+
+            SendFrame(Protocol.ProtocolVersion.V1, r.ToArray());
+
+            var response = ReceiveFrameData(out _);
+            if (response.Length < S7Codec.ResponseHeaderLength)
+                throw new S7ConnectionException("InitSSL response is shorter than its header");
+            Log($"InitSSL acknowledged ({response.Length} bytes)");
+        }
+
+        private void ActivateTls(System.IO.Stream network)
+        {
+            var authOptions = new SslClientAuthenticationOptions
+            {
+                TargetHost = Host,
+                // The CPU presents a self-signed per-device certificate, so there
+                // is no chain to validate against a public root.
+                RemoteCertificateValidationCallback = (_, _, _, _) => true,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+            };
+
+            var authTask = HarpoTlsAuth.AuthenticateUsingTlsAsync(network, authOptions, "SIMATIC-ROOT-HMI");
+            if (!authTask.Wait(TimeoutMs))
+                throw new S7TimeoutException($"TLS handshake with {Host} timed out after {TimeoutMs} ms");
+
+            _ssl = authTask.Result;
+            _ssl.ReadTimeout = TimeoutMs;
+            _ssl.WriteTimeout = TimeoutMs;
+            Log($"TLS activated ({_ssl.SslProtocol}, {_ssl.NegotiatedCipherSuite})");
         }
 
         /// <summary>Delete the session on the PLC and close the socket.</summary>
@@ -168,6 +284,21 @@ namespace CsS7CommPlus.V3.Session
                 try { DeleteSession(); } catch { /* best effort */ }
             }
 
+            try { _ssl?.Dispose(); } catch { /* ignore */ }
+            try { _iso?.Close(); } catch { /* ignore */ }
+            ResetState();
+        }
+
+        /// <summary>Close the socket immediately, without the clean-up requests.</summary>
+        public void Abort()
+        {
+            try { _iso?.Abort(); } catch { /* ignore */ }
+            try { _ssl?.Dispose(); } catch { /* ignore */ }
+            ResetState();
+        }
+
+        private void ResetState()
+        {
             _connected = false;
             _sessionReady = false;
             SessionId = 0;
@@ -175,40 +306,23 @@ namespace CsS7CommPlus.V3.Session
             _sequenceNumber = 0;
             ProtocolVersion = 0;
             _serverSessionVersion = null;
+            _publicKeyFingerprint = null;
+            _sessionChallenge = null;
+            _sessionKey = null;
             _withIntegrityId = false;
             _integrityIdRead = 0;
             _integrityIdWrite = 0;
             ProtectionLevel = null;
             _notificationFrames.Clear();
-
-            try { _ssl?.Dispose(); } catch { /* ignore */ }
-            try { _tcp?.Close(); } catch { /* ignore */ }
             _ssl = null;
-            _tcp = null;
-        }
-
-        /// <summary>Close the socket immediately, without the clean-up requests.</summary>
-        public void Abort()
-        {
-            _connected = false;
-            _sessionReady = false;
-            try { _tcp?.Client?.Close(0); } catch { /* ignore */ }
-            try { _ssl?.Dispose(); } catch { /* ignore */ }
-            try { _tcp?.Close(); } catch { /* ignore */ }
-            _ssl = null;
-            _tcp = null;
-            _notificationFrames.Clear();
+            _iso = null;
+            _transport = null;
         }
 
         /// <inheritdoc/>
         public void Dispose() => Disconnect();
 
         // --- request / response --------------------------------------------
-
-        private bool _withIntegrityId;
-        private uint _integrityIdRead;
-        private uint _integrityIdWrite;
-        private byte[]? _serverSessionVersion;
 
         private ushort NextSequenceNumber()
         {
@@ -224,9 +338,10 @@ namespace CsS7CommPlus.V3.Session
         /// <param name="functionCode">The function to invoke.</param>
         /// <param name="payload">Request payload, after the 14-byte request header.</param>
         /// <param name="integrityTail">
-        /// How many trailing payload bytes the V2 IntegrityId is spliced in *before*:
-        /// 4 for GetMultiVariables and SetMultiVariables (a trailing UInt32), 5 for
-        /// Explore (a trailing UInt32 plus a filler byte), 3 for SetVariable.
+        /// How many trailing payload bytes the IntegrityId is spliced in *before*:
+        /// 4 for GetMultiVariables and SetMultiVariables (a trailing 32-bit fill),
+        /// 5 for Explore (a fill plus a filler byte), 3 for SetVariable, and for
+        /// CreateObject whatever the request builder reports.
         /// </param>
         public byte[] SendRequest(FunctionCode functionCode, byte[]? payload = null, int integrityTail = 4)
         {
@@ -243,15 +358,19 @@ namespace CsS7CommPlus.V3.Session
             ushort seq = NextSequenceNumber();
             ushort fc = (ushort)functionCode;
 
-            byte transportFlags = S7Protocol.Flags34FunctionCodes.Contains(fc) ? (byte)0x34 : (byte)0x36;
+            // After session-key authentication every request uses 0x34, matching
+            // TIA Portal; otherwise it depends on the request class.
+            byte transportFlags = _sessionKey != null || S7Protocol.Flags34FunctionCodes.Contains(fc)
+                ? (byte)0x34
+                : (byte)0x36;
+
             var requestHeader = S7Codec.EncodeRequestHeader(fc, seq, SessionId, transportFlags);
 
             byte[] integrityIdBytes = new byte[0];
             if (_withIntegrityId)
             {
                 bool isRead = S7Protocol.ReadFunctionCodes.Contains(fc);
-                uint integrityId = isRead ? _integrityIdRead : _integrityIdWrite;
-                integrityIdBytes = Vlq.EncodeUInt32(integrityId);
+                integrityIdBytes = Vlq.EncodeUInt32(isRead ? _integrityIdRead : _integrityIdWrite);
             }
 
             // The IntegrityId sits just before the payload's trailing fill bytes,
@@ -270,8 +389,7 @@ namespace CsS7CommPlus.V3.Session
                 request.AddRange(payload);
             }
 
-            var requestBytes = request.ToArray();
-            SendFrame(ProtocolVersion, requestBytes);
+            SendFrame(_sessionKey != null ? Protocol.ProtocolVersion.V3 : ProtocolVersion, request.ToArray());
 
             if (_withIntegrityId)
             {
@@ -283,35 +401,56 @@ namespace CsS7CommPlus.V3.Session
 
             var response = ReceiveResponse(seq);
             ValidateResponseHeader(response, fc, seq);
-            return S7Codec.Slice(response, S7Codec.ResponseHeaderLength,
-                                 response.Length - S7Codec.ResponseHeaderLength);
+
+            var responsePayload = S7Codec.Slice(response, S7Codec.ResponseHeaderLength,
+                                                response.Length - S7Codec.ResponseHeaderLength);
+
+            // An authenticated session prefixes its response payload with the
+            // IntegrityId it answered under.
+            if (_sessionKey != null && responsePayload.Length > 1)
+            {
+                Vlq.DecodeUInt32(responsePayload, 0, out int consumed);
+                responsePayload = S7Codec.Slice(responsePayload, consumed, responsePayload.Length - consumed);
+            }
+
+            return responsePayload;
         }
 
         /// <summary>
-        /// Wrap a request in the frame header and trailer and write it to the
-        /// TLS stream.  A frame is 0x72, version, length, data, then the
-        /// 0x72 version 0x0000 end-of-frame trailer.
+        /// Wrap a request in the frame header and trailer and send it.  A V3 frame
+        /// also carries the digest of its own data, length-prefixed, ahead of the
+        /// request.
         /// </summary>
         private void SendFrame(ProtocolVersion version, byte[] data)
         {
-            if (_ssl == null) throw new S7ConnectionException("Not connected");
+            if (_transport == null) throw new S7ConnectionException("Not connected");
 
-            var frame = new List<byte>(data.Length + 8);
-            frame.AddRange(S7Codec.EncodeHeader(version, data.Length));
-            frame.AddRange(data);
+            byte[] framePayload;
+            if (version == Protocol.ProtocolVersion.V3 && _sessionKey != null)
+            {
+                var digest = ComputeDigest(data);
+                framePayload = new byte[1 + digest.Length + data.Length];
+                framePayload[0] = IntegrityDigestLength;
+                Array.Copy(digest, 0, framePayload, 1, digest.Length);
+                Array.Copy(data, 0, framePayload, 1 + digest.Length, data.Length);
+            }
+            else
+            {
+                framePayload = data;
+            }
+
+            var frame = new List<byte>(framePayload.Length + 8);
+            frame.AddRange(S7Codec.EncodeHeader(version, framePayload.Length));
+            frame.AddRange(framePayload);
             frame.AddRange(new byte[] { S7Protocol.ProtocolId, (byte)version, 0x00, 0x00 });
 
-            var bytes = frame.ToArray();
-            try
-            {
-                _ssl.Write(bytes, 0, bytes.Length);
-                _ssl.Flush();
-            }
-            catch (IOException e)
-            {
-                _connected = false;
-                throw new S7ConnectionException($"Send failed: {e.Message}", e);
-            }
+            _transport.Send(frame.ToArray());
+        }
+
+        private byte[] ComputeDigest(byte[] data)
+        {
+            using var hmac = new HMACSHA256(S7Codec.Slice(_sessionKey!, 0, DigestKeyLength));
+            return hmac.ComputeHash(data);
         }
 
         /// <summary>
@@ -327,7 +466,7 @@ namespace CsS7CommPlus.V3.Session
             {
                 var data = ReceiveFrameData(out var version);
 
-                if (version == ProtocolVersion.SystemEvent)
+                if (version == Protocol.ProtocolVersion.SystemEvent)
                 {
                     CheckSystemEvent(data);
                     if (++systemEvents > MaxSystemEventsPerResponse)
@@ -365,7 +504,11 @@ namespace CsS7CommPlus.V3.Session
         /// Read one complete PDU and return its data section.  A large response —
         /// an Explore of a big program, typically — arrives as several fragments,
         /// each 0x72 version length data, and only the last is followed by the
-        /// zero-length trailer; the fragments' data sections are concatenated.
+        /// zero-length trailer.
+        ///
+        /// On an authenticated session each fragment carries a digest, and those
+        /// digests are cumulative: the digest on fragment two covers fragment one's
+        /// data as well, so one running digest spans the whole response.
         /// </summary>
         private byte[] ReceiveFrameData(out ProtocolVersion version)
         {
@@ -377,57 +520,123 @@ namespace CsS7CommPlus.V3.Session
             int fragmentLength = (header[2] << 8) | header[3];
             if (fragmentLength == 0) return new byte[0];        // standalone trailer
 
-            var data = new List<byte>(fragmentLength);
-            data.AddRange(ReadExact(fragmentLength));
-            int fragments = 1;
-
-            while (true)
+            IncrementalHash? running = null;
+            try
             {
-                var next = ReadExact(4);
-                if (next[0] != S7Protocol.ProtocolId)
-                    throw new S7ProtocolException($"Expected an S7comm-plus fragment header, got 0x{next[0]:X2}");
+                if (_sessionKey != null && version == Protocol.ProtocolVersion.V3)
+                    running = IncrementalHash.CreateHMAC(
+                        HashAlgorithmName.SHA256, S7Codec.Slice(_sessionKey, 0, DigestKeyLength));
 
-                var nextVersion = (ProtocolVersion)next[1];
-                int nextLength = (next[2] << 8) | next[3];
+                var data = new List<byte>(fragmentLength);
+                data.AddRange(VerifyFragment(ReadExact(fragmentLength), version, running));
+                int fragments = 1;
 
-                if (nextLength == 0) break;                     // trailer: that was the last fragment
+                while (true)
+                {
+                    var next = ReadExact(4);
+                    if (next[0] != S7Protocol.ProtocolId)
+                        throw new S7ProtocolException($"Expected an S7comm-plus fragment header, got 0x{next[0]:X2}");
 
-                if (nextVersion != version)
-                    throw new S7ProtocolException(
-                        $"Response changed fragment version from V{(int)version} to V{(int)nextVersion}");
+                    var nextVersion = (ProtocolVersion)next[1];
+                    int nextLength = (next[2] << 8) | next[3];
 
-                data.AddRange(ReadExact(nextLength));
+                    if (nextLength == 0) break;                 // trailer: that was the last fragment
 
-                if (++fragments > MaxReassembledFragments || data.Count > MaxReassembledBytes)
-                    throw new S7ConnectionException(
-                        $"Reassembled response exceeds its limits ({data.Count} bytes, {fragments} fragments)");
+                    if (nextVersion != version)
+                        throw new S7ProtocolException(
+                            $"Response changed fragment version from V{(int)version} to V{(int)nextVersion}");
+
+                    data.AddRange(VerifyFragment(ReadExact(nextLength), version, running));
+
+                    if (++fragments > MaxReassembledFragments || data.Count > MaxReassembledBytes)
+                        throw new S7ConnectionException(
+                            $"Reassembled response exceeds its limits ({data.Count} bytes, {fragments} fragments)");
+                }
+
+                return data.ToArray();
+            }
+            finally
+            {
+                running?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Check and strip a fragment's digest.  An authenticated session must not
+        /// accept an unauthenticated frame, and a failed check means the session is
+        /// no longer trustworthy, so it is dropped rather than retried.
+        /// </summary>
+        private byte[] VerifyFragment(byte[] fragment, ProtocolVersion version, IncrementalHash? running)
+        {
+            if (_sessionKey == null)
+            {
+                if (version == Protocol.ProtocolVersion.V3)
+                    throw new S7ProtocolException("Received a V3 frame without a session key");
+                return fragment;
             }
 
-            return data.ToArray();
+            if (version != Protocol.ProtocolVersion.V3)
+            {
+                InvalidateOnIntegrityFailure();
+                throw new S7IntegrityException(
+                    $"Authenticated session received an unauthenticated V{(int)version} frame; reconnect");
+            }
+
+            if (fragment.Length == 0) throw new S7IntegrityException("Empty authenticated frame");
+
+            int digestLength = fragment[0];
+            if (digestLength != IntegrityDigestLength)
+                throw new S7IntegrityException($"Invalid frame digest length {digestLength}");
+            if (fragment.Length < 1 + digestLength)
+                throw new S7IntegrityException("Truncated frame digest");
+
+            var received = S7Codec.Slice(fragment, 1, digestLength);
+            var applicationData = S7Codec.Slice(fragment, 1 + digestLength, fragment.Length - 1 - digestLength);
+
+            byte[] expected;
+            if (running != null)
+            {
+                running.AppendData(applicationData);
+                expected = running.GetCurrentHash();
+            }
+            else
+            {
+                expected = ComputeDigest(applicationData);
+            }
+
+            if (!FixedTimeEquals(received, expected))
+            {
+                InvalidateOnIntegrityFailure();
+                throw new S7IntegrityException("S7comm-plus response failed its integrity check");
+            }
+
+            return applicationData;
+        }
+
+        private static bool FixedTimeEquals(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+            return diff == 0;
+        }
+
+        /// <summary>Discard the session without writing to a stream that can no longer be trusted.</summary>
+        private void InvalidateOnIntegrityFailure()
+        {
+            _sessionReady = false;
+            Abort();
         }
 
         private byte[] ReadExact(int count)
         {
-            if (_ssl == null) throw new S7ConnectionException("Not connected");
+            var transport = _transport ?? throw new S7ConnectionException("Not connected");
 
             var buffer = new byte[count];
             int read = 0;
             while (read < count)
             {
-                int n;
-                try
-                {
-                    n = _ssl.Read(buffer, read, count - read);
-                }
-                catch (IOException e)
-                {
-                    _connected = false;
-                    if (e.InnerException is SocketException se &&
-                        (se.SocketErrorCode == SocketError.TimedOut || se.SocketErrorCode == SocketError.WouldBlock))
-                        throw new S7TimeoutException($"Receive timed out after {TimeoutMs} ms");
-                    throw new S7ConnectionException($"Receive failed: {e.Message}", e);
-                }
-
+                int n = transport.Read(buffer, read, count - read);
                 if (n <= 0)
                 {
                     _connected = false;
@@ -489,21 +698,16 @@ namespace CsS7CommPlus.V3.Session
                 while (true)
                 {
                     var data = ReceiveFrameData(out var version);
-                    if (version == ProtocolVersion.SystemEvent) { CheckSystemEvent(data); continue; }
-                    if (data.Length > 0 && data[0] == (byte)Opcode.Notification) return data;
+                    if (version == Protocol.ProtocolVersion.SystemEvent) { CheckSystemEvent(data); continue; }
                     if (data.Length == 0) continue;
-                    throw new S7ConnectionException(
-                        $"Expected a notification, got opcode 0x{data[0]:X2}");
+                    if (data[0] == (byte)Opcode.Notification) return data;
+                    throw new S7ConnectionException($"Expected a notification, got opcode 0x{data[0]:X2}");
                 }
             }
         }
 
         /// <summary>Set the receive timeout used while waiting for notifications.</summary>
-        public void SetReceiveTimeout(int milliseconds)
-        {
-            if (_ssl != null) _ssl.ReadTimeout = milliseconds;
-            if (_tcp != null) _tcp.ReceiveTimeout = milliseconds;
-        }
+        public void SetReceiveTimeout(int milliseconds) => _transport?.SetReadTimeout(milliseconds);
 
         // --- system events ---------------------------------------------------
 
@@ -561,7 +765,6 @@ namespace CsS7CommPlus.V3.Session
                         throw new S7ProtocolException($"Malformed system event ReturnValue: {ToHex(payload)}");
                     long value = 0;
                     for (int i = 0; i < size; i++) value = (value << 8) | payload[offset + i];
-                    if (size == 8) return value;
                     return value;
                 }
                 offset += size;
@@ -608,10 +811,10 @@ namespace CsS7CommPlus.V3.Session
 
         /// <summary>
         /// Open the session with a CreateObject on the NullServerSession.  The
-        /// attribute set introduces the client the way TIA Portal does: V1-initial
-        /// S7-1200 firmware only returns ServerSessionVersion when the client
-        /// identifies itself this fully, and a minimal request yields an
-        /// incomplete session.
+        /// attribute set introduces the client the way TIA Portal does: a
+        /// V1-initial CPU only returns ServerSessionVersion, its public-key
+        /// fingerprint and its challenge when the client identifies itself this
+        /// fully, and a minimal request yields an incomplete session.
         /// </summary>
         private void CreateSession()
         {
@@ -670,11 +873,9 @@ namespace CsS7CommPlus.V3.Session
             if (response.Length < S7Codec.ResponseHeaderLength)
                 throw new S7ConnectionException("CreateObject response is shorter than its header");
 
-            int offset;
-            var objectIds = S7Codec.ParseCreateObjectSessionId(
-                S7Codec.Slice(response, S7Codec.ResponseHeaderLength,
-                              response.Length - S7Codec.ResponseHeaderLength),
-                out offset, out ulong returnValue);
+            var body = S7Codec.Slice(response, S7Codec.ResponseHeaderLength,
+                                     response.Length - S7Codec.ResponseHeaderLength);
+            var objectIds = S7Codec.ParseCreateObjectSessionId(body, out int offset, out ulong returnValue);
 
             if (objectIds.Count == 0)
                 throw new S7ConnectionException("CreateObject response carries no session object id");
@@ -687,16 +888,19 @@ namespace CsS7CommPlus.V3.Session
             // Some firmware returns a non-zero status on a session that works, so
             // this is informational and the returned session data is still parsed.
             if (returnValue != 0)
-                Log($"CreateObject returned 0x{returnValue:X} on an active TLS session; continuing");
+                Log($"CreateObject returned 0x{returnValue:X}; continuing to parse the returned session data");
 
-            int treeStart = S7Codec.ResponseHeaderLength + offset;
             var attrs = S7Codec.ParseCreateObjectAttributes(
-                S7Codec.Slice(response, treeStart, response.Length - treeStart));
+                S7Codec.Slice(body, offset, body.Length - offset));
 
             _serverSessionVersion = attrs.ServerSessionVersion;
-            Log(_serverSessionVersion != null
-                ? $"Session 0x{SessionId:X8} created, V{(int)version}, ServerSessionVersion {_serverSessionVersion.Length} bytes"
-                : $"Session 0x{SessionId:X8} created, V{(int)version}, no ServerSessionVersion in the response");
+            _publicKeyFingerprint = attrs.PublicKeyFingerprint;
+            _sessionChallenge = attrs.SessionChallenge;
+
+            Log($"Session 0x{SessionId:X8} created, V{(int)version}, " +
+                $"ServerSessionVersion {(_serverSessionVersion?.Length ?? 0)} bytes, " +
+                $"key {(_publicKeyFingerprint ?? "(none)")}, " +
+                $"challenge {(_sessionChallenge == null ? "(none)" : _sessionChallenge.Length + " bytes")}");
         }
 
         private static void AppendWStringAttribute(List<byte> buffer, uint attributeId, string value)
@@ -713,9 +917,12 @@ namespace CsS7CommPlus.V3.Session
         /// <summary>
         /// Complete session setup by echoing ServerSessionVersion back in a V2
         /// SetMultiVariables, with transport flags 0x34 and no IntegrityId yet.
-        /// The device PAOM string is blanked first, as TIA Portal does.
+        /// The device identity string is blanked first, as TIA Portal does.
+        ///
+        /// On the SessionKey variant the same write also carries the solved
+        /// challenge, at element 1830.
         /// </summary>
-        private bool SetupSession()
+        private bool SetupSession(SessionKeyMaterial? material)
         {
             if (_serverSessionVersion == null) return false;
 
@@ -725,10 +932,24 @@ namespace CsS7CommPlus.V3.Session
             r.AddRange(S7Codec.EncodeRequestHeader((ushort)FunctionCode.SetMultiVariables, seq, SessionId, 0x34));
 
             S7Codec.AppendUInt32(r, SessionId);                 // InObjectId
-            Vlq.AppendUInt32(r, 1);                             // ItemCount
-            Vlq.AppendUInt32(r, 1);                             // AddressCount
-            Vlq.AppendUInt32(r, (uint)ObjectId.ServerSessionVersion);
-            Vlq.AppendUInt32(r, 1);                             // ItemNumber
+
+            if (material != null)
+            {
+                Vlq.AppendUInt32(r, 2);                         // ItemCount
+                Vlq.AppendUInt32(r, 2);                         // AddressCount
+                Vlq.AppendUInt32(r, LegitimationIds.SessionSetupLegitimation);
+                Vlq.AppendUInt32(r, (uint)ObjectId.ServerSessionVersion);
+                Vlq.AppendUInt32(r, 1);                         // ItemNumber of the security key
+                r.AddRange(SessionKeyAuth.EncodeSecurityKeyStruct(material));
+                Vlq.AppendUInt32(r, 2);                         // ItemNumber of the session version
+            }
+            else
+            {
+                Vlq.AppendUInt32(r, 1);                         // ItemCount
+                Vlq.AppendUInt32(r, 1);                         // AddressCount
+                Vlq.AppendUInt32(r, (uint)ObjectId.ServerSessionVersion);
+                Vlq.AppendUInt32(r, 1);                         // ItemNumber
+            }
 
             r.AddRange(S7Codec.StripPaomStringInSessionVersion(_serverSessionVersion));
 
@@ -758,6 +979,27 @@ namespace CsS7CommPlus.V3.Session
             return true;
         }
 
+        /// <summary>
+        /// Activate the session after the challenge was accepted.  TIA Portal
+        /// writes 5 to element 323 of the session object immediately after the key
+        /// exchange and before any data read, and the CPU expects the same.  The
+        /// key qualifier carries the current sequence number as a fixed-width
+        /// value, and the IntegrityId is spliced in before the three trailing zeros.
+        /// </summary>
+        private void ActivateSession()
+        {
+            var p = new List<byte>();
+            S7Codec.AppendUInt32(p, SessionId);
+            Vlq.AppendUInt32(p, 1);                             // AddressCount
+            Vlq.AppendUInt32(p, 323);                           // element id
+            p.Add(0x00); p.Add((byte)DataType.USInt); Vlq.AppendUInt32(p, 5);
+            p.AddRange(S7Codec.EncodeObjectQualifier(_sequenceNumber, Protocol.ProtocolVersion.V1));
+            p.AddRange(new byte[3]);
+
+            SendRequest(FunctionCode.SetVariable, p.ToArray(), 3);
+            Log("Session activated");
+        }
+
         /// <summary>Close the session on the PLC with a DeleteObject.</summary>
         private void DeleteSession()
         {
@@ -767,7 +1009,7 @@ namespace CsS7CommPlus.V3.Session
             r.AddRange(S7Codec.EncodeRequestHeader((ushort)FunctionCode.DeleteObject, seq, SessionId, 0x34));
             S7Codec.AppendUInt32(r, 0);
 
-            SendFrame(ProtocolVersion, r.ToArray());
+            SendFrame(_sessionKey != null ? Protocol.ProtocolVersion.V3 : ProtocolVersion, r.ToArray());
             try { ReceiveFrameData(out _); } catch { /* best effort */ }
         }
 
@@ -783,6 +1025,8 @@ namespace CsS7CommPlus.V3.Session
                 var response = SendRequest(FunctionCode.GetVarSubStreamed, payload, 4);
                 return ParseScalarUDIntResponse(response);
             }
+            catch (S7IntegrityException) { throw; }
+            catch (S7ConnectionException) { throw; }
             catch (S7Exception e)
             {
                 Log($"PLC did not report a protection level: {e.Message}");
@@ -811,7 +1055,7 @@ namespace CsS7CommPlus.V3.Session
         {
             ulong returnValue = Vlq.DecodeUInt64(payload, 0, out int offset);
             if (returnValue != 0)
-                throw new S7ConnectionException($"GetVarSubStreamed failed: return_value=0x{returnValue:X}");
+                throw new S7ProtocolException($"GetVarSubStreamed failed: return_value=0x{returnValue:X}");
 
             if (offset >= payload.Length) throw new S7ProtocolException("GetVarSubStreamed response has no marker");
             offset += 1;                                               // protocol-defined unknown byte
