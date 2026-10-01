@@ -86,6 +86,45 @@ namespace CsS7CommPlus
             if (V3Backend != null) { try { V3Backend.Close(); } catch { /* ignore */ } V3Backend = null; }
         }
 
+        /// <summary>
+        /// Drop the connection without the clean-up requests.  Use this when the
+        /// link is already dead, or when a call has hung and the socket must be
+        /// torn down to make it return; a graceful <see cref="Close"/> would block
+        /// trying to talk to a PLC that is no longer answering.
+        /// </summary>
+        public void Abort()
+        {
+            var backend = V3Backend;
+            V3Backend = null;
+            if (backend != null)
+            {
+                try
+                {
+                    if (backend is IV3AbortableBackend abortable) abortable.Abort();
+                    else backend.Close();
+                }
+                catch { /* ignore */ }
+            }
+            try { _conn.Close(); } catch { /* ignore */ }
+        }
+
+        /// <summary>
+        /// Open the integrity-protected V3 session now, rather than on the first
+        /// read.  A caller that holds a long-lived connection wants to know at
+        /// once whether the PLC accepted the session, and <see cref="Connect"/>
+        /// only opens the clear-text V1 path.
+        /// </summary>
+        /// <returns>A success <see cref="Response"/>, or one carrying the reason the session could not open.</returns>
+        public Response OpenSession()
+        {
+            var sess = EnsureV3(out var err);
+            if (err != null) return new Response(null, false, err);
+            return new Response(null, sess != null && sess.Connected, 0x00);
+        }
+
+        /// <summary>Whether the V3 session is open.</summary>
+        public bool SessionOpen => V3Backend != null && V3Backend.Connected;
+
         // --- V3 session seam ----------------------------------------------
         private IV3Backend? EnsureV3(out string? error)
         {
@@ -248,6 +287,71 @@ namespace CsS7CommPlus
                     .ToList();
             }
             catch (Exception e) { return list.Select(t => new Response(t, null, e.Message)).ToList(); }
+        }
+
+        // --- subscriptions (optional backend capability) -------------------
+
+        /// <summary>
+        /// Whether the configured backend can have the PLC push changed values.
+        /// When false, a caller that needs continuous data must poll with
+        /// <see cref="ReadList"/>.
+        /// </summary>
+        public bool SupportsSubscriptions
+        {
+            get
+            {
+                var sess = EnsureV3(out var err);
+                return err == null && sess is IV3SubscriptionBackend;
+            }
+        }
+
+        /// <summary>Whether a subscription is currently active.</summary>
+        public bool Subscribed => V3Backend is IV3SubscriptionBackend sub && sub.Subscribed;
+
+        /// <summary>
+        /// Subscribe to a set of symbolic tags and have the PLC push changes
+        /// every <paramref name="cycleMs"/> milliseconds.  This is how TIA Portal
+        /// and Siemens HMIs collect data; for a large tag set it costs far less
+        /// than re-reading everything each cycle.
+        ///
+        /// The <see cref="Response.Value"/> is true when the PLC accepted the
+        /// subscription.  A false value with a Success status means the PLC
+        /// declined it and the caller should poll instead.
+        /// </summary>
+        public Response Subscribe(IEnumerable<string> tags, int cycleMs = 500)
+        {
+            var sess = EnsureV3(out var err);
+            if (err != null) return new Response(null, false, err);
+            if (!(sess is IV3SubscriptionBackend sub))
+                return new Response(null, false, "the configured V3 backend does not support subscriptions");
+
+            try { return new Response(null, sub.Subscribe(tags, cycleMs), 0x00); }
+            catch (Exception e) { return new Response(null, false, e.Message); }
+        }
+
+        /// <summary>
+        /// Wait for the PLC's next notification and return the values it carried.
+        /// The PLC sends one each cycle, empty when nothing changed, so an empty
+        /// list is a healthy result.  Returns null when nothing arrived within
+        /// <paramref name="timeoutMs"/>, which after several cycles means the
+        /// connection should be treated as lost.
+        /// </summary>
+        public IList<Response>? WaitForChanges(int timeoutMs = 2000)
+        {
+            if (!(V3Backend is IV3SubscriptionBackend sub) || !sub.Subscribed) return null;
+
+            var changes = sub.WaitForChanges(timeoutMs);
+            if (changes == null) return null;
+
+            return changes
+                .Select(c => new Response(c.Name, c.Value, c.IsGood ? (object)0x00 : "bad quality"))
+                .ToList();
+        }
+
+        /// <summary>Delete the subscription on the PLC.</summary>
+        public void Unsubscribe()
+        {
+            if (V3Backend is IV3SubscriptionBackend sub && sub.Subscribed) sub.Unsubscribe();
         }
 
         /// <summary>Write one symbolic tag by name; datatype override is optional.</summary>

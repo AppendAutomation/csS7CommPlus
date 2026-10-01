@@ -29,7 +29,14 @@ src/CsS7CommPlus/            class library (netstandard2.0; net6.0; net8.0)
   IntegrityProvider.cs           integrity hook (s7p_comm.IntegrityProvider)
   Backend/IV3Backend.cs          the V3 session seam (s7p_v3.py)
   PLC.cs                         the facade (s7p.py)
-tests/CsS7CommPlus.Tests/     xUnit tests (codecs/framing/parser/models)
+src/CsS7CommPlus.V3/         the protocol-version-3 backend (net8.0)
+  Protocol/                      VLQ, constants, wire codecs
+  Session/                       TLS session, requests, subscriptions
+  Symbols/                       type-info parsing, symbol tree, catalog
+  Values/                        value decoding and formatting
+  S7CommPlusClient.cs            browse / read / write / subscribe
+  V3Backend.cs                   IV3Backend + IV3SubscriptionBackend
+tests/CsS7CommPlus.Tests/     xUnit tests (codecs/framing/parser/models/V3)
 examples/BasicExample/
 ```
 
@@ -57,29 +64,42 @@ static `BuildWriteRequest` / `BuildReadSingleRequest` builders.
   example in spec §12.1 is reproduced byte-for-byte by the tests.
 - The **Explore** name parsers and the read/write PDU builders.
 
-## Protocol version 3 (Explore / Read / Write) — the backend seam
+## Protocol version 3 (Explore / Read / Write) — `CsS7CommPlus.V3`
 
-On S7-1200 FW4+ the V3 traffic is wrapped in SIMATIC integrity protection.
-Exactly as in the Python library — where that crypto is an **external MIT
-dependency** (gijzelaerr/s7commplus), not part of the library's own code — the
-C# port delegates the V3 session to a pluggable `IV3Backend`.  Per the wire-spec
-Appendix C, the C# backend is **HarpoS7 / the S7CommPlusDriver**.
+Everything that reads *data* travels over the integrity-protected
+protocol-version-3 session, which the core library delegates to a pluggable
+`IV3Backend`.  **`src/CsS7CommPlus.V3/` is that backend**, a port of the
+MIT-licensed `s7commplus` Python implementation's protocol layer, with the
+session authentication taken from HarpoS7 (MIT, via NuGet).
 
-Provide it by implementing `IV3Backend` (Browse / Read / Write over the
-integrity-protected session) and setting the factory:
+Wire it in and the facade works against a live PLC:
 
 ```csharp
-comm.V3BackendFactory = plc => new S7CommPlusDriverBackend(plc);  // your adapter
-comm.GetTagList();                                   // now browses live
-comm.Read("SPDL BLU Winder DB.driveKp");             // now reads live
+using CsS7CommPlus;
+using CsS7CommPlus.V3;
+
+using var comm = new PLC("192.168.2.50");
+comm.V3BackendFactory = plc => new V3Backend(plc);
+
+var tags = comm.GetTagList();                        // browse the symbol tree
+var r = comm.Read("SPDL BLU Winder DB.driveKp");     // 85.5
+comm.Write("SPDL BLU Winder DB.typeOfWinder", 3);
+
+comm.Subscribe(new[] { "HBTimer" }, cycleMs: 500);   // the PLC pushes changes
+var changes = comm.WaitForChanges(2000);
 ```
 
-Without a backend, `GetTagList` / `Read` / `ReadList` / `Write` return a clear
-`Status` explaining that the V3 backend must be wired — the direct analog of
-pyS7commplus when its `s7commplus` dependency is absent.  The adapter over the
-local `S7CommPlusDriver` (Connect/Browse/ReadValues/WriteValues, with
-SymbolCRC = 0 for optimized DBs, as the Python side learned) is the remaining
-integration to light up live V3.
+It covers PLCs configured with **TIA Portal V17 or later** (S7-1200 FW V4.3+,
+S7-1500 FW V2.9+), where the V2 framing travels inside TLS and carries no keyed
+frame digest.  The pre-V17 legacy challenge scheme is not implemented.
+
+See **[docs/V3-BACKEND.md](docs/V3-BACKEND.md)** for the session sequence, why
+symbolic access is needed for optimized blocks, the batching limits, the
+process-area quirks, and what the port deliberately leaves out.
+
+Without any backend, `GetTagList` / `Read` / `ReadList` / `Write` still return a
+clear `Status` saying the V3 backend must be wired — the direct analog of
+pyS7commplus when its `s7commplus` dependency is absent.
 
 ## Build & test
 
@@ -88,7 +108,12 @@ dotnet build  CsS7CommPlus.sln -c Release
 dotnet test   tests/CsS7CommPlus.Tests
 ```
 
+The V3 tests check the port against vectors produced by the Python
+implementation for the same inputs, so a divergence fails a test rather than
+producing a request a PLC quietly rejects.
+
 ## Licence
 
-Apache-2.0 (same as pyS7commplus).  The V3 integrity backend (HarpoS7 /
-S7CommPlusDriver) is MIT — see `THIRD-PARTY-NOTICES.md`.
+Apache-2.0 (same as pyS7commplus).  `CsS7CommPlus.V3` is a port of the
+MIT-licensed `s7commplus` and depends on HarpoS7 (MIT) — see
+`THIRD-PARTY-NOTICES.md`.

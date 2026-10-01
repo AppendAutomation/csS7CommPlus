@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>CsS7CommPlus.V3</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>CsS7CommPlus Contributors</Authors>
+    <Description>Protocol-version-3 session backend for CsS7CommPlus: Explore, symbolic read/write and subscriptions over the integrity-protected S7comm-plus session. Ported from the MIT-licensed s7commplus Python backend; session authentication comes from HarpoS7 (MIT).</Description>
+    <PackageTags>PLC;Siemens;S7;S7comm-plus;S7-1200;S7-1500;Industrial</PackageTags>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CsS7CommPlus\CsS7CommPlus.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- MIT: S7comm-plus session authentication (legacy challenge + TLS) and the
+         Siemens public-key set. See THIRD-PARTY-NOTICES.md. -->
+    <PackageReference Include="HarpoS7" Version="1.1.4" />
+    <PackageReference Include="HarpoS7.PublicKeys" Version="1.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CsS7CommPlus.Tests" />
+  </ItemGroup>
+
+</Project>

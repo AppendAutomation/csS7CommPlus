@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\CsS7CommPlus\CsS7CommPlus.csproj" />
+    <ProjectReference Include="..\..\src\CsS7CommPlus.V3\CsS7CommPlus.V3.csproj" />
   </ItemGroup>
 
   <ItemGroup>
