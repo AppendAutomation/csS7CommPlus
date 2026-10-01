@@ -130,29 +130,48 @@ namespace CsS7CommPlus.V3.Symbols
     public class SymbolCatalog : IEnumerable<SymbolicTag>
     {
         private readonly Dictionary<string, SymbolicTag> _tags;
+        private readonly Dictionary<string, SymbolicTag> _aliases;
 
         /// <summary>Build a catalog from browsed symbols, keeping the first of any duplicate name.</summary>
         public SymbolCatalog(IEnumerable<SymbolicTag> tags)
+            : this(tags, null) { }
+
+        /// <summary>
+        /// Build a catalog with alternative spellings that also resolve.  A
+        /// process-area symbol is catalogued under its plain TIA name and kept
+        /// resolvable under the browse's own area-qualified spelling as well.
+        /// </summary>
+        public SymbolCatalog(IEnumerable<SymbolicTag> tags,
+                             IEnumerable<KeyValuePair<string, SymbolicTag>>? aliases)
         {
             _tags = new Dictionary<string, SymbolicTag>(StringComparer.Ordinal);
             foreach (var tag in tags)
             {
                 if (!_tags.ContainsKey(tag.Name)) _tags[tag.Name] = tag;
             }
+
+            _aliases = new Dictionary<string, SymbolicTag>(StringComparer.Ordinal);
+            if (aliases == null) return;
+            foreach (var alias in aliases)
+            {
+                if (!_tags.ContainsKey(alias.Key) && !_aliases.ContainsKey(alias.Key))
+                    _aliases[alias.Key] = alias.Value;
+            }
         }
 
-        /// <summary>Number of symbols in the catalog.</summary>
+        /// <summary>Number of symbols in the catalog, not counting alternative spellings.</summary>
         public int Count => _tags.Count;
 
         /// <summary>Resolve a symbolic name, or throw when the PLC does not know it.</summary>
         public SymbolicTag Resolve(string name)
         {
-            if (_tags.TryGetValue(name, out var tag)) return tag;
+            if (TryResolve(name, out var tag)) return tag;
             throw new KeyNotFoundException($"Unknown symbolic tag: '{name}'");
         }
 
         /// <summary>Resolve a symbolic name, returning false when the PLC does not know it.</summary>
-        public bool TryResolve(string name, out SymbolicTag tag) => _tags.TryGetValue(name, out tag!);
+        public bool TryResolve(string name, out SymbolicTag tag) =>
+            _tags.TryGetValue(name, out tag!) || _aliases.TryGetValue(name, out tag!);
 
         /// <inheritdoc/>
         public IEnumerator<SymbolicTag> GetEnumerator() => _tags.Values.GetEnumerator();

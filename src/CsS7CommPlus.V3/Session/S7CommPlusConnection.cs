@@ -1,12 +1,10 @@
 using System;
 using System.Collections.Generic;
-using System.Net.Security;
-using System.Security.Authentication;
+using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using CsS7CommPlus.V3.Protocol;
 using CsS7CommPlus.V3.Transport;
-using HarpoS7.Tls;
 
 namespace CsS7CommPlus.V3.Session
 {
@@ -64,7 +62,7 @@ namespace CsS7CommPlus.V3.Session
         private readonly Queue<byte[]> _notificationFrames = new Queue<byte[]>();
 
         private IsoTcpConnection? _iso;
-        private SslStream? _ssl;
+        private Stream? _tls;
         private IPduTransport? _transport;
 
         private ushort _sequenceNumber;
@@ -105,7 +103,7 @@ namespace CsS7CommPlus.V3.Session
         public bool Connected => _connected;
 
         /// <summary>Whether the session is protected by TLS rather than a keyed digest.</summary>
-        public bool TlsActive => _ssl != null;
+        public bool TlsActive => _tls != null;
 
         /// <summary>Whether frames carry a keyed digest, i.e. the SessionKey variant is in use.</summary>
         public bool SessionKeyActive => _sessionKey != null;
@@ -143,50 +141,66 @@ namespace CsS7CommPlus.V3.Session
         /// </summary>
         public void Connect()
         {
+            // A CPU supports one session variant, so the only reliable way to find
+            // out is to offer the TLS handshake and see whether it is taken. One
+            // that wants the older scheme refuses it, and the socket is then no
+            // longer usable, so the fallback reconnects.
+            if (Mode == SessionMode.SessionKey)
+            {
+                ConnectOnce(useTls: false);
+                return;
+            }
+
+            if (Mode == SessionMode.Tls)
+            {
+                ConnectOnce(useTls: true);
+                return;
+            }
+
+            try
+            {
+                ConnectOnce(useTls: true);
+                return;
+            }
+            catch (S7AuthenticationException e)
+            {
+                Log($"TLS was refused ({e.Message}); trying the session-key scheme");
+            }
+            catch (S7ConnectionException e)
+            {
+                Log($"TLS did not complete ({e.Message}); trying the session-key scheme");
+            }
+
+            Disconnect();
+            ConnectOnce(useTls: false);
+        }
+
+        private void ConnectOnce(bool useTls)
+        {
             try
             {
                 _iso = new IsoTcpConnection(Host, Port);
+                _iso.Open(TimeoutMs);
+                _transport = _iso;
 
-                if (Mode == SessionMode.Tls)
+                InitSsl();
+
+                if (useTls)
                 {
-                    // HarpoS7 drives the COTP handshake, the InitSSL exchange and
-                    // the TLS handshake over the raw socket and hands back the
-                    // authenticated stream.
-                    _iso.OpenSocketOnly(TimeoutMs);
-                    ActivateTls(_iso.NetworkStream);
-                    _transport = new StreamPduTransport(_ssl!);
-                }
-                else
-                {
-                    _iso.Open(TimeoutMs);
-                    _transport = _iso;
-                    InitSsl();
+                    _tls = SiemensTlsHandshake.Activate(_iso, Log);
+                    _transport = new StreamPduTransport(_tls, _iso);
+                    Log("TLS activated; its records travel inside COTP data frames");
                 }
 
                 CreateSession();
 
-                bool wantsSessionKey = _sessionChallenge != null && _publicKeyFingerprint != null;
+                bool wantsSessionKey = !useTls && _sessionChallenge != null && _publicKeyFingerprint != null;
 
                 if (Mode == SessionMode.SessionKey && !wantsSessionKey)
                     throw new S7AuthenticationException(
-                        "SessionKey authentication was requested but the PLC offered no challenge; " +
-                        "this CPU was configured with TIA Portal V17 or later and wants the TLS session");
+                        "SessionKey authentication was requested but the PLC offered no challenge");
 
-                if (Mode == SessionMode.Automatic && !wantsSessionKey && !TlsActive)
-                {
-                    // The CPU answered without a challenge, so it expects the TLS
-                    // session. Start again with TLS rather than guessing on.
-                    Log("PLC offered no session challenge; reconnecting with TLS");
-                    ResetState();
-                    _iso = new IsoTcpConnection(Host, Port);
-                    _iso.OpenSocketOnly(TimeoutMs);
-                    ActivateTls(_iso.NetworkStream);
-                    _transport = new StreamPduTransport(_ssl!);
-                    CreateSession();
-                    wantsSessionKey = false;
-                }
-
-                if (TlsActive)
+                if (useTls)
                 {
                     // Inside TLS the data PDUs are V2, whatever CreateObject used.
                     ProtocolVersion = ProtocolVersion.V2;
@@ -210,26 +224,17 @@ namespace CsS7CommPlus.V3.Session
                     throw new S7ConnectionException("The PLC rejected S7comm-plus session setup");
 
                 _sessionReady = true;
+                _withIntegrityId = true;
+                _integrityIdRead = 0;
+                _integrityIdWrite = 0;
+                _connected = true;
 
                 if (material != null)
                 {
-                    // From here every frame carries a keyed digest and the two
-                    // IntegrityId counters.
+                    // From here every frame carries a keyed digest.
                     _sessionKey = material.SessionKey;
-                    _withIntegrityId = true;
-                    _integrityIdRead = 0;
-                    _integrityIdWrite = 0;
-                    Log("Session key accepted; frame digests and IntegrityId tracking enabled");
-
-                    _connected = true;      // SendRequest needs the session to count as live
+                    Log("Session key accepted; frame digests enabled");
                     ActivateSession();
-                }
-                else
-                {
-                    _withIntegrityId = true;
-                    _integrityIdRead = 0;
-                    _integrityIdWrite = 0;
-                    _connected = true;
                 }
 
                 ProtectionLevel = ReadEffectiveProtectionLevel();
@@ -262,27 +267,6 @@ namespace CsS7CommPlus.V3.Session
             Log($"InitSSL acknowledged ({response.Length} bytes)");
         }
 
-        private void ActivateTls(System.IO.Stream network)
-        {
-            var authOptions = new SslClientAuthenticationOptions
-            {
-                TargetHost = Host,
-                // The CPU presents a self-signed per-device certificate, so there
-                // is no chain to validate against a public root.
-                RemoteCertificateValidationCallback = (_, _, _, _) => true,
-                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-            };
-
-            var authTask = HarpoTlsAuth.AuthenticateUsingTlsAsync(network, authOptions, "SIMATIC-ROOT-HMI");
-            if (!authTask.Wait(TimeoutMs))
-                throw new S7TimeoutException($"TLS handshake with {Host} timed out after {TimeoutMs} ms");
-
-            _ssl = authTask.Result;
-            _ssl.ReadTimeout = TimeoutMs;
-            _ssl.WriteTimeout = TimeoutMs;
-            Log($"TLS activated ({_ssl.SslProtocol}, {_ssl.NegotiatedCipherSuite})");
-        }
-
         /// <summary>Delete the session on the PLC and close the socket.</summary>
         public void Disconnect()
         {
@@ -291,7 +275,7 @@ namespace CsS7CommPlus.V3.Session
                 try { DeleteSession(); } catch { /* best effort */ }
             }
 
-            try { _ssl?.Dispose(); } catch { /* ignore */ }
+            try { _tls?.Dispose(); } catch { /* ignore */ }
             try { _iso?.Close(); } catch { /* ignore */ }
             ResetState();
         }
@@ -300,7 +284,7 @@ namespace CsS7CommPlus.V3.Session
         public void Abort()
         {
             try { _iso?.Abort(); } catch { /* ignore */ }
-            try { _ssl?.Dispose(); } catch { /* ignore */ }
+            try { _tls?.Dispose(); } catch { /* ignore */ }
             ResetState();
         }
 
@@ -321,7 +305,7 @@ namespace CsS7CommPlus.V3.Session
             _integrityIdWrite = 0;
             ProtectionLevel = null;
             _notificationFrames.Clear();
-            _ssl = null;
+            _tls = null;
             _iso = null;
             _transport = null;
         }

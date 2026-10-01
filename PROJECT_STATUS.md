@@ -15,9 +15,17 @@ Python pyS7commplus, and `CsS7CommPlus.V3` is a port of the MIT-licensed
   `WaitForChanges` / `Unsubscribe`.
 
 ## Done — V3 backend (`CsS7CommPlus.V3`, net8.0)
-- The full session for PLCs configured with TIA Portal V17 or later: COTP,
-  InitSSL, the TLS handshake over COTP data frames, CreateObject, and the V2
-  session-setup echo with the device identity string blanked.
+- Both session variants, chosen automatically by offering the TLS handshake and
+  falling back when a CPU refuses it:
+  - **TLS** (TIA Portal V17+): COTP, InitSSL, a TLS 1.3 handshake whose records
+    travel inside COTP data frames, CreateObject, and the V2 session-setup echo
+    with the device identity string blanked. The handshake is BouncyCastle's,
+    not `SslStream`'s, because a SIMATIC CPU resets the connection on the hello
+    SChannel sends and `SslStream` cannot be configured per connection.
+  - **SessionKey** (TIA Portal V16 and earlier): the CPU's challenge solved with
+    HarpoS7, encoded into the SecurityKey structure, and then a 32-byte
+    HMAC-SHA256 on every frame with cumulative digests across the fragments of
+    one response, plus the session activation TIA Portal performs.
 - V2 IntegrityId tracking, with the read and write counters spliced into each
   request at the position the protocol expects per function.
 - Multi-fragment response reassembly, system-event handling, stale-response
@@ -34,15 +42,12 @@ Python pyS7commplus, and `CsS7CommPlus.V3` is a port of the MIT-licensed
 - Session authentication from HarpoS7 (MIT, NuGet) rather than reimplemented.
 
 ## Tests
-170 passing. The V3 tests assert against vectors produced by the Python
+173 passing. The V3 tests assert against vectors produced by the Python
 implementation for the same inputs: the VLQ forms, the object qualifier, item
 addresses, PValue encode/decode, the vartype and name lists, the symbol-tree
 flattening, the notification parser and the value decoder.
 
 ## Not implemented
-- The pre-TIA-V17 legacy challenge (`SessionKey`) authentication path. HarpoS7
-  supplies that crypto, so it could be added; today such a PLC fails to connect
-  rather than falling back.
 - Password legitimation: it needs the TLS exporter secret (RFC 5705), which
   .NET's `SslStream` does not expose. A password-protected PLC connects and
   reports its protection level, then refuses what that level forbids.
@@ -50,8 +55,22 @@ flattening, the notification parser and the value decoder.
 - zlib preset-dictionary blob decoding. Only the XML tag-browser path needs it,
   and the symbol browse here reads the binary type-info container instead.
 
-## Not yet verified
-The V3 backend has not been run against a live PLC from this repository. The
-bench CPU is an S7-1212C FW V4.6 at 192.168.2.50. Until that run happens, treat
-the protocol layer as "tested against the reference implementation's vectors",
-not as "proven on the wire".
+## Verified live
+Against the bench S7-1212C FW V4.6 (`OMSP_12.00.02.11`) at 192.168.2.50 on
+2026-10-01, over TLS 1.3 with `TLS_AES_128_GCM_SHA256` on x25519:
+
+- connect in about 0.4 s; the CPU reports protection level 1;
+- the whole symbol tree browsed: 2290 symbols in 1.56 s;
+- optimized-DB reads (`HMI_Tags.Core_Size`, `SPDL BLU Winder DB.InstTPID.Kp1`,
+  `IEC_Timer_0_DB.ET`) and process-area reads (`Core OD Offset`, `Tension Raw`,
+  `CommsHeartbeat`) all correct; an unknown tag errors per item;
+- 9 tags in 31 ms, and 152 tags — a site-sized set — in 209 ms;
+- a subscription whose first notification carries every value and which then
+  delivers only what changed, on a 500 ms cycle.
+
+Note on the bench CPU: it answers the clear-text CreateObject with a challenge
+and a public-key fingerprint, as though it wanted the SessionKey scheme, but it
+rejects the session-setup write that carries the solution. The Python
+implementation this was ported from fails there identically, byte-for-byte, so
+that challenge appears to be vestigial on this firmware. The automatic probe
+tries TLS first for exactly this reason.

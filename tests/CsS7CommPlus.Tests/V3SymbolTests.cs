@@ -144,6 +144,51 @@ namespace CsS7CommPlus.Tests
             Assert.Equal(Ids.ControllerAreaValueActual, tag.AccessSubArea);
         }
 
+        /// <summary>
+        /// The browse roots the I/Q/M subtrees under a name it invents, because
+        /// those areas have none.  TIA Portal shows those symbols as plain PLC
+        /// tags, and a site tag list spells them that way, so the catalogued name
+        /// must be the plain one — with the browse's own spelling still resolving.
+        /// </summary>
+        [Fact]
+        public void CatalogStripsTheInventedProcessAreaRoot()
+        {
+            var tag = new SymbolicTag { Name = "Tension Raw", AccessArea = Ids.NativeTheIAreaRid };
+            var catalog = new SymbolCatalog(
+                new[] { tag },
+                new[] { new KeyValuePair<string, SymbolicTag>("IArea.Tension Raw", tag) });
+
+            Assert.Equal(1, catalog.Count);
+            Assert.Same(tag, catalog.Resolve("Tension Raw"));
+            Assert.Same(tag, catalog.Resolve("IArea.Tension Raw"));
+        }
+
+        /// <summary>A data block keeps its own name, which is already the TIA one.</summary>
+        [Fact]
+        public void CatalogKeepsDataBlockNames()
+        {
+            var catalog = new SymbolCatalog(new[]
+            {
+                new SymbolicTag { Name = "HMI_Tags.Core_Size", AccessArea = 0x8A0E0006 },
+            });
+
+            Assert.Equal("HMI_Tags.Core_Size", catalog.Resolve("HMI_Tags.Core_Size").Name);
+        }
+
+        /// <summary>An alternative spelling never shadows a real symbol of that name.</summary>
+        [Fact]
+        public void CatalogPrefersARealSymbolOverAnAlias()
+        {
+            var real = new SymbolicTag { Name = "Overlap" };
+            var other = new SymbolicTag { Name = "MArea.Overlap" };
+
+            var catalog = new SymbolCatalog(
+                new[] { real },
+                new[] { new KeyValuePair<string, SymbolicTag>("Overlap", other) });
+
+            Assert.Same(real, catalog.Resolve("Overlap"));
+        }
+
         [Fact]
         public void CatalogMatchesNamesCaseSensitively()
         {

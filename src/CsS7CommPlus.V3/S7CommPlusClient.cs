@@ -294,13 +294,46 @@ namespace CsS7CommPlus.V3
         /// <summary>The cached symbol catalog, browsing the PLC on first use.</summary>
         public SymbolCatalog TagCatalog => _catalog ?? RefreshTagCatalog();
 
+        /// <summary>
+        /// The names the browse roots the process areas under.  A data block's
+        /// subtree is rooted at the block's own name, but the I, Q and M areas have
+        /// none, so the browse invents one; TIA Portal shows those symbols as plain
+        /// PLC tags, so the invented prefix is dropped from the catalogued name and
+        /// kept only as an alternative spelling.
+        /// </summary>
+        private static readonly string[] ProcessAreaRoots =
+            { "IArea.", "QArea.", "MArea.", "S7Timers.", "S7Counters." };
+
         /// <summary>Browse the PLC and replace the cached symbol catalog.</summary>
         public SymbolCatalog RefreshTagCatalog()
         {
             var tags = new List<SymbolicTag>();
-            foreach (var info in Browse()) tags.Add(SymbolicTag.FromVarInfo(info));
-            _catalog = new SymbolCatalog(tags);
+            var aliases = new List<KeyValuePair<string, SymbolicTag>>();
+
+            foreach (var info in Browse())
+            {
+                var tag = SymbolicTag.FromVarInfo(info);
+                string plain = StripProcessAreaRoot(tag.Name);
+                if (!string.Equals(plain, tag.Name, StringComparison.Ordinal))
+                {
+                    aliases.Add(new KeyValuePair<string, SymbolicTag>(tag.Name, tag));
+                    tag.Name = plain;
+                }
+                tags.Add(tag);
+            }
+
+            _catalog = new SymbolCatalog(tags, aliases);
             return _catalog;
+        }
+
+        private static string StripProcessAreaRoot(string name)
+        {
+            foreach (var root in ProcessAreaRoots)
+            {
+                if (name.StartsWith(root, StringComparison.Ordinal) && name.Length > root.Length)
+                    return name.Substring(root.Length);
+            }
+            return name;
         }
 
         /// <summary>Discard the cached catalog after a PLC program change.</summary>

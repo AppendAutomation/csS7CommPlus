@@ -22,6 +22,10 @@
     <!-- MIT: S7comm-plus session authentication (legacy challenge + TLS) and the
          Siemens public-key set. See THIRD-PARTY-NOTICES.md. -->
     <PackageReference Include="HarpoS7" Version="1.1.4" />
+    <!-- MIT: the managed TLS stack. A SIMATIC CPU resets the connection on the
+         hello .NET's own SslStream sends, and SslStream cannot be told otherwise
+         per connection, so the handshake is driven from here. -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
     <PackageReference Include="HarpoS7.PublicKeys" Version="1.1.4" />
   </ItemGroup>
 

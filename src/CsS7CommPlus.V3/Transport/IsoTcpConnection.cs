@@ -354,9 +354,17 @@ namespace CsS7CommPlus.V3.Transport
     public sealed class StreamPduTransport : IPduTransport
     {
         private readonly Stream _stream;
+        private readonly IsoTcpConnection? _underlying;
 
-        /// <summary>Wrap an authenticated stream.</summary>
-        public StreamPduTransport(Stream stream) => _stream = stream;
+        /// <summary>
+        /// Wrap an authenticated stream.  A managed TLS stream cannot carry a read
+        /// timeout itself, so <paramref name="underlying"/> is where one is set.
+        /// </summary>
+        public StreamPduTransport(Stream stream, IsoTcpConnection? underlying = null)
+        {
+            _stream = stream;
+            _underlying = underlying;
+        }
 
         /// <inheritdoc/>
         public void Send(byte[] frame)
@@ -371,6 +379,7 @@ namespace CsS7CommPlus.V3.Transport
         /// <inheritdoc/>
         public void SetReadTimeout(int milliseconds)
         {
+            if (_underlying != null) { _underlying.SetReadTimeout(milliseconds); return; }
             try { _stream.ReadTimeout = milliseconds; } catch (InvalidOperationException) { /* not timeoutable */ }
         }
     }
