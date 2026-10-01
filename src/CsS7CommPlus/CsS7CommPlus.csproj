@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net6.0;net8.0</TargetFrameworks>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>CsS7CommPlus</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>CsS7CommPlus Contributors</Authors>
+    <Description>C# library for S7comm-plus communication with Siemens S7-1200/1500 PLCs (a port of pyS7commplus)</Description>
+    <PackageTags>PLC;Siemens;S7;S7comm-plus;S7-1200;S7-1500;Industrial</PackageTags>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CsS7CommPlus.Tests" />
+  </ItemGroup>
+
+</Project>
