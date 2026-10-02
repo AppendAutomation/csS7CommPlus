@@ -159,6 +159,26 @@ read. It then sends one notification per cycle, **empty when nothing changed** �
 an empty list is a healthy result, and a run of timeouts is the signal that the
 connection is gone.
 
+`cycleMs` is **a sampling rate, not a change filter**. The PLC compares the
+symbols once per cycle and reports whatever differs from last time, so a value
+that moves several times within one cycle is reported once, at its latest value.
+Measured on the bench CPU against a millisecond counter:
+
+| Cycle | Notification interval | Counter advance per notification |
+|---|---|---|
+| 200 ms | 191–201 ms | +195 to +203 ms |
+| 500 ms | 494–501 ms | +495 to +503 ms |
+| 1000 ms | 998–1001 ms | +997 to +1001 ms |
+
+At a 1000 ms cycle that counter changed about a thousand times between
+notifications and one value arrived. To catch a short pulse — an alarm bit set
+for 50 ms, say — the cycle has to be shorter than the pulse, or the subscription
+will step over it entirely.
+
+The protocol also has a per-reference trigger mode (attribute 1005) that this
+backend does not set, so the PLC's default applies. Whether it offers a true
+unsampled on-change mode is untested.
+
 ## Measured on the bench S7-1212C
 
 Over the LAN from this repository, 2026-10-01:

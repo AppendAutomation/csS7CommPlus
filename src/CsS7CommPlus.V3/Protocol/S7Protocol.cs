@@ -306,7 +306,11 @@ namespace CsS7CommPlus.V3.Protocol
         public const uint SubscriptionActive = 1041;
         /// <summary>Reference list of subscribed items.</summary>
         public const uint SubscriptionReferenceList = 1048;
-        /// <summary>Cycle time in multiples of 100 ms.</summary>
+        /// <summary>
+        /// How often the PLC samples the subscribed symbols, in milliseconds.
+        /// It is a sampling rate, not a change filter: a value that moves more
+        /// than once within a cycle is reported once, at its latest value.
+        /// </summary>
         public const uint SubscriptionCycleTime = 1049;
         /// <summary>Delay before the first notification.</summary>
         public const uint SubscriptionDelayTime = 1050;
