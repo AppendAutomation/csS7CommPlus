@@ -1,5 +1,7 @@
 # CsS7CommPlus
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A C# library for **S7comm-plus** communication with Siemens **S7-1200 / S7-1500**
 PLCs — a straight port of the Python pyS7commplus library,
 in the same spirit that [cslogix](https://github.com/AppendAutomation/cslogix) ports pylogix.
