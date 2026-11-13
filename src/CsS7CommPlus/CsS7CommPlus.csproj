@@ -9,6 +9,7 @@
     <PackageId>CsS7CommPlus</PackageId>
     <Version>0.1.0</Version>
     <Authors>CsS7CommPlus Contributors</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Description>C# library for S7comm-plus communication with Siemens S7-1200/1500 PLCs (a port of pyS7commplus)</Description>
     <PackageTags>PLC;Siemens;S7;S7comm-plus;S7-1200;S7-1500;Industrial</PackageTags>
     <RepositoryType>git</RepositoryType>
