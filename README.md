@@ -117,6 +117,6 @@ producing a request a PLC quietly rejects.
 
 ## Licence
 
-Apache-2.0 (same as pyS7commplus).  `CsS7CommPlus.V3` is a port of the
-MIT-licensed `s7commplus` and depends on HarpoS7 (MIT) — see
+MIT — see `LICENSE`.  `CsS7CommPlus.V3` is a port of the MIT-licensed
+`s7commplus` and depends on HarpoS7 (MIT) and BouncyCastle (MIT) — see
 `THIRD-PARTY-NOTICES.md`.
