@@ -659,7 +659,8 @@ namespace CsS7CommPlus.V3
         /// Ten is the value real S7-1500 CPUs accept.
         /// </param>
         /// <returns>The subscription id the PLC assigned.</returns>
-        public uint CreateSubscription(IReadOnlyList<SubscriptionItem> items, int cycleMs = 100, short creditLimit = 10)
+        public uint CreateSubscription(IReadOnlyList<SubscriptionItem> items, int cycleMs = 100,
+                                      short creditLimit = SubscriptionCodec.DefaultCreditLimit)
         {
             if (_connection.SubscriptionContainerId == 0)
                 throw new S7ProtocolException("The PLC did not provide a subscription container object");

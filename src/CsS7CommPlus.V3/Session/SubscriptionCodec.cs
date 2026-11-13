@@ -136,7 +136,7 @@ namespace CsS7CommPlus.V3.Session
                                                       IReadOnlyList<SubscriptionItem> items,
                                                       out int integrityTail,
                                                       int cycleMs = 100,
-                                                      short creditLimit = 10,
+                                                      short creditLimit = DefaultCreditLimit,
                                                       byte changeCounter = 1,
                                                       uint relationId = DefaultRelationId,
                                                       byte routeMode = 0x14)
@@ -186,6 +186,20 @@ namespace CsS7CommPlus.V3.Session
             integrityTail = p.Count - requestSetSize;
             return p.ToArray();
         }
+
+        /// <summary>
+        /// Notifications the PLC will send before it waits to be given more.
+        ///
+        /// The credit limit is flow control: the CPU sends this many
+        /// notifications and then goes quiet -- not an error, and not a closed
+        /// connection, simply nothing more until its credit is replenished.
+        /// Replenishing it is not implemented here, so a caller that needs a
+        /// subscription to run indefinitely re-creates it when the CPU falls
+        /// silent. At the default of 1000 and a 500 ms cycle that is once every
+        /// eight minutes or so; the original value of 10 meant every five
+        /// seconds, which is how this came to light.
+        /// </summary>
+        public const short DefaultCreditLimit = 1000;
 
         /// <summary>Build the payload that deletes one subscription container.</summary>
         public static byte[] BuildDeleteSubscriptionRequest(uint subscriptionId, ProtocolVersion protocolVersion)

@@ -59,6 +59,9 @@ namespace CsS7CommPlus.V3.Session
         private const int DigestKeyLength = 24;
 
         private readonly object _requestLock = new object();
+
+        /// <summary>How long ReceiveNotification waits; see SetReceiveTimeout.</summary>
+        private int _notificationTimeoutMs = 2000;
         private readonly Queue<byte[]> _notificationFrames = new Queue<byte[]>();
 
         private IsoTcpConnection? _iso;
@@ -692,6 +695,19 @@ namespace CsS7CommPlus.V3.Session
 
                 while (true)
                 {
+                    // Wait for the frame before reading it, rather than letting
+                    // the read time out. A read that times out is fatal to a TLS
+                    // session -- see IPduTransport.WaitForData -- so a caller
+                    // waiting on a CPU that has gone quiet would not merely come
+                    // away empty, it would come away with a dead connection.
+                    var transport = _transport ?? throw new S7ConnectionException("Not connected");
+
+                    if (!transport.WaitForData(_notificationTimeoutMs))
+                    {
+                        throw new S7TimeoutException(
+                            $"No notification within {_notificationTimeoutMs} ms");
+                    }
+
                     var data = ReceiveFrameData(out var version);
                     if (version == Protocol.ProtocolVersion.SystemEvent) { CheckSystemEvent(data); continue; }
                     if (data.Length == 0) continue;
@@ -701,8 +717,17 @@ namespace CsS7CommPlus.V3.Session
             }
         }
 
-        /// <summary>Set the receive timeout used while waiting for notifications.</summary>
-        public void SetReceiveTimeout(int milliseconds) => _transport?.SetReadTimeout(milliseconds);
+        /// <summary>
+        /// Set how long <see cref="ReceiveNotification"/> waits for the next
+        /// notification.
+        ///
+        /// This no longer shortens the socket's own read timeout. The wait is
+        /// done before the read now, so the read keeps the generous timeout the
+        /// connection was opened with -- which is what a half-arrived record
+        /// needs to finish, and what keeps a quiet CPU from killing the session.
+        /// </summary>
+        public void SetReceiveTimeout(int milliseconds) =>
+            _notificationTimeoutMs = Math.Max(1, milliseconds);
 
         // --- system events ---------------------------------------------------
 

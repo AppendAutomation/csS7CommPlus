@@ -26,6 +26,19 @@ namespace CsS7CommPlus.V3.Transport
 
         /// <summary>Set how long a read may block, in milliseconds.</summary>
         void SetReadTimeout(int milliseconds);
+
+        /// <summary>
+        /// Wait until a byte can be read, without reading one.
+        ///
+        /// This is how a caller waits for something that may never come —
+        /// a subscription notification — because letting the read itself time
+        /// out is not survivable over TLS: the timeout surfaces inside the TLS
+        /// record layer, which treats any transport failure as fatal, and every
+        /// later read then fails with "Cannot read application data on failed
+        /// TLS connection". Waiting here instead leaves the stream untouched.
+        /// </summary>
+        /// <returns>False when nothing arrived in time.</returns>
+        bool WaitForData(int timeoutMs);
     }
 
     /// <summary>
@@ -231,6 +244,36 @@ namespace CsS7CommPlus.V3.Transport
         public bool DataAvailable =>
             _offset < _buffer.Length || (_stream != null && _stream.DataAvailable);
 
+        /// <inheritdoc/>
+        public bool WaitForData(int timeoutMs)
+        {
+            // Bytes of the current COTP payload are already in hand.
+            if (_offset < _buffer.Length) return true;
+
+            var socket = _tcp?.Client;
+            if (socket == null) throw new S7ConnectionException("Not connected");
+
+            // Poll counts microseconds. It also reports ready when the peer has
+            // closed, which is right: the read that follows then says so plainly
+            // instead of waiting out the timeout.
+            long micros = Math.Min(Math.Max(0L, (long)timeoutMs) * 1000L, int.MaxValue);
+
+            try
+            {
+                return socket.Poll((int)micros, SelectMode.SelectRead);
+            }
+            catch (SocketException e)
+            {
+                Connected = false;
+                throw new S7ConnectionException($"Receive failed: {e.Message}", e);
+            }
+            catch (ObjectDisposedException)
+            {
+                Connected = false;
+                throw new S7ConnectionException("Connection closed");
+            }
+        }
+
         private void WriteTpkt(byte[] payload)
         {
             if (_stream == null) throw new S7ConnectionException("Not connected");
@@ -381,6 +424,21 @@ namespace CsS7CommPlus.V3.Transport
         {
             if (_underlying != null) { _underlying.SetReadTimeout(milliseconds); return; }
             try { _stream.ReadTimeout = milliseconds; } catch (InvalidOperationException) { /* not timeoutable */ }
+        }
+
+        /// <summary>
+        /// Waits on the socket underneath.
+        ///
+        /// A record layer may be holding plaintext it has already decrypted,
+        /// which no socket can announce -- BouncyCastle will not report it in
+        /// blocking mode either. That costs an empty wait at worst: the frame is
+        /// still there, and the next pass reads it along with whatever arrived
+        /// meanwhile. It is the safe way round, because the alternative is a
+        /// read that times out inside the record layer and takes the session.
+        /// </summary>
+        public bool WaitForData(int timeoutMs)
+        {
+            return _underlying == null || _underlying.WaitForData(timeoutMs);
         }
     }
 }
