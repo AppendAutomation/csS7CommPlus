@@ -1,8 +1,8 @@
 # CsS7CommPlus
 
 A C# library for **S7comm-plus** communication with Siemens **S7-1200 / S7-1500**
-PLCs — a straight port of the Python [pyS7commplus](../pyS7CommPlus) library,
-in the same spirit that [cslogix](../../AppendAutomation/cslogix) ports pylogix.
+PLCs — a straight port of the Python pyS7commplus library,
+in the same spirit that [cslogix](https://github.com/AppendAutomation/cslogix) ports pylogix.
 The public interface mirrors pyS7commplus / pylogix: every operation returns a
 `Response` with `TagName`, `Value` and `Status`.
 

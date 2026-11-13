@@ -1,6 +1,6 @@
 # Build output
-bin/
-obj/
+[Bb]in/
+[Oo]bj/
 [Dd]ebug/
 [Rr]elease/
 x64/
@@ -42,3 +42,12 @@ coverage*.cobertura.xml
 # OS
 .DS_Store
 Thumbs.db
+
+# Publish output
+[Pp]ublish/
+
+# Logs / local environment
+*.log
+*.binlog
+.env
+.env.local
