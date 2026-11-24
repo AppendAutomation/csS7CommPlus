@@ -16,7 +16,10 @@ Python pyS7commplus, and `CsS7CommPlus.V3` is a port of the MIT-licensed
 
 ## Done — V3 backend (`CsS7CommPlus.V3`, net8.0)
 - Both session variants, chosen automatically by offering the TLS handshake and
-  falling back when a CPU refuses it:
+  falling back when a CPU refuses it, and each tried with two CreateObject
+  variants — the full TIA-Portal-style identification first, then the minimal
+  ClientRID-only request on a fresh transport when the CPU answers the fuller
+  one with a non-zero return value and no ServerSessionVersion:
   - **TLS** (TIA Portal V17+): COTP, InitSSL, a TLS 1.3 handshake whose records
     travel inside COTP data frames, CreateObject, and the V2 session-setup echo
     with the device identity string blanked. The handshake is BouncyCastle's,
@@ -42,7 +45,7 @@ Python pyS7commplus, and `CsS7CommPlus.V3` is a port of the MIT-licensed
 - Session authentication from HarpoS7 (MIT, NuGet) rather than reimplemented.
 
 ## Tests
-173 passing. The V3 tests assert against vectors produced by the Python
+177 passing. The V3 tests assert against vectors produced by the Python
 implementation for the same inputs: the VLQ forms, the object qualifier, item
 addresses, PValue encode/decode, the vartype and name lists, the symbol-tree
 flattening, the notification parser and the value decoder.
@@ -74,3 +77,25 @@ rejects the session-setup write that carries the solution. The Python
 implementation this was ported from fails there identically, byte-for-byte, so
 that challenge appears to be vestigial on this firmware. The automatic probe
 tries TLS first for exactly this reason.
+
+## Re-verified live, 2026-11-24 — the CPU's session response changed
+
+The same CPU at 192.168.2.50 no longer accepts the full TIA-Portal-style
+identification that the 2026-10-01 connect above used. It now answers that
+CreateObject with return value `0xE022BD00019FFF7A` and omits
+`ServerSessionVersion` entirely, so the 2026-10-01 result does not reproduce as
+recorded: a connect fails at session setup in every mode until the driver falls
+back to the minimal ClientRID-only request (the port of
+`pyS7CommPlus_cli` `b30edf7`). The socket is not reusable after the refusal, so
+the retry reconnects.
+
+With the fallback in place, against the same CPU:
+
+- `Automatic` and `Tls` both connect — the full request is refused, the minimal
+  one yields `ServerSessionVersion` 83 bytes, fingerprint
+  `01:BD426B091F08731A` and a 20-byte challenge, session setup completes, the
+  CPU reports protection level 1 — and `HMI_Tags.Core_Size` reads 7, matching
+  the value on the PLC.
+- `SessionKey` now reaches the setup write (the retry fires and the key blob is
+  built) and is then refused there, which is the same vestigial-challenge wall
+  described above, not the identification problem.

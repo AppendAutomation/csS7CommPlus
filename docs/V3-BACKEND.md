@@ -66,6 +66,33 @@ Python implementation this was ported from fails on that CPU in exactly the same
 way, byte-for-byte, so the challenge it offers appears to be vestigial. That is
 why the probe tries TLS *first* rather than trusting the challenge.
 
+## Two CreateObject variants, also tried in turn
+
+Within whichever session variant is in use, the CreateObject that opens the
+session comes in two shapes, and firmware is split on which it will take:
+
+- **Full identification** — attributes 233, 289, 296, 297, 298, 299,
+  `ServerSessionClientRid` (300) and 301, introducing the client the way TIA
+  Portal does. Most CPUs return `ServerSessionVersion`, their public-key
+  fingerprint and their challenge only for this fuller request.
+- **Minimal** — the `ServerSessionClientRid` attribute alone, which is what the
+  reference driver's `SetNullServerSessionData()` sends. Some S7-1200 firmware
+  **rejects** the full request: it answers with a non-zero return value and
+  omits `ServerSessionVersion` entirely, and accepts only this.
+
+A missing `ServerSessionVersion` cannot be worked around later in the
+handshake, so `Connect` tries the full request first and, on that specific
+refusal, **reconnects and retries with the minimal one**. The retry needs a
+fresh transport — the socket is not reusable after the refusal. The condition is
+reported as `S7MissingSessionVersionException`, a subclass of
+`S7ConnectionException` so the TLS-to-SessionKey fallback still catches it, and
+the retry is attempted inside all three modes.
+
+This is the C# port of `pyS7CommPlus_cli` `b30edf7`. The bench S7-1212C
+exhibited the refusal from 2026-11-24, having accepted the full request on
+2026-10-01, so a CPU can change its mind across a firmware or project change
+and both paths have to stay.
+
 ## The TLS handshake does not use SslStream
 
 A SIMATIC CPU is particular about the client hello, and answers one it dislikes
@@ -241,3 +268,11 @@ VLQ forms, the object qualifier, item addresses, PValue encode and decode, the
 vartype and name lists, the symbol-tree flattening, the notification parser and
 the value decoder. A divergence in the port fails a test instead of producing a
 request the PLC quietly rejects.
+
+`V3SessionRequestTests.cs` pins down the two CreateObject variants: both carry
+the ClientRID exactly once, the minimal one carries none of the identification
+attributes, the header and the subscription container are the same in both, and
+`S7MissingSessionVersionException` — the condition the retry keys on — is a
+`S7ConnectionException`, so the mode fallback still catches it. The retry itself
+needs a CPU that refuses the full request, so it is verified against the bench
+PLC rather than in the suite.

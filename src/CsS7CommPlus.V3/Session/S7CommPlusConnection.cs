@@ -150,19 +150,19 @@ namespace CsS7CommPlus.V3.Session
             // longer usable, so the fallback reconnects.
             if (Mode == SessionMode.SessionKey)
             {
-                ConnectOnce(useTls: false);
+                ConnectWithIdentificationFallback(useTls: false);
                 return;
             }
 
             if (Mode == SessionMode.Tls)
             {
-                ConnectOnce(useTls: true);
+                ConnectWithIdentificationFallback(useTls: true);
                 return;
             }
 
             try
             {
-                ConnectOnce(useTls: true);
+                ConnectWithIdentificationFallback(useTls: true);
                 return;
             }
             catch (S7AuthenticationException e)
@@ -175,10 +175,34 @@ namespace CsS7CommPlus.V3.Session
             }
 
             Disconnect();
-            ConnectOnce(useTls: false);
+            ConnectWithIdentificationFallback(useTls: false);
         }
 
-        private void ConnectOnce(bool useTls)
+        /// <summary>
+        /// Create the session, introducing the client with the full
+        /// TIA-Portal-style attribute set. Firmware that rejects that request
+        /// answers with a non-zero return value and no ServerSessionVersion,
+        /// but accepts the minimal ClientRID-only request the reference driver
+        /// sends, so retry with it on a fresh transport.
+        /// </summary>
+        private void ConnectWithIdentificationFallback(bool useTls)
+        {
+            try
+            {
+                ConnectOnce(useTls, fullIdentification: true);
+                return;
+            }
+            catch (S7MissingSessionVersionException)
+            {
+                Log("CreateObject returned no ServerSessionVersion; retrying with the " +
+                    "minimal ClientRID-only session request");
+            }
+
+            Disconnect();
+            ConnectOnce(useTls, fullIdentification: false);
+        }
+
+        private void ConnectOnce(bool useTls, bool fullIdentification = true)
         {
             try
             {
@@ -195,7 +219,15 @@ namespace CsS7CommPlus.V3.Session
                     Log("TLS activated; its records travel inside COTP data frames");
                 }
 
-                CreateSession();
+                CreateSession(fullIdentification);
+
+                // A refused session request comes back with none of the session
+                // data at all, so test for that before deciding the PLC "offered
+                // no challenge" - otherwise the identification retry never
+                // happens in SessionKey mode.
+                if (_serverSessionVersion == null)
+                    throw new S7MissingSessionVersionException(
+                        "PLC did not return a ServerSessionVersion attribute; session setup cannot continue");
 
                 bool wantsSessionKey = !useTls && _sessionChallenge != null && _publicKeyFingerprint != null;
 
@@ -208,10 +240,6 @@ namespace CsS7CommPlus.V3.Session
                     // Inside TLS the data PDUs are V2, whatever CreateObject used.
                     ProtocolVersion = ProtocolVersion.V2;
                 }
-
-                if (_serverSessionVersion == null)
-                    throw new S7ConnectionException(
-                        "PLC did not return a ServerSessionVersion attribute; session setup cannot continue");
 
                 SessionKeyMaterial? material = null;
                 if (wantsSessionKey)
@@ -830,16 +858,17 @@ namespace CsS7CommPlus.V3.Session
         // --- session establishment ------------------------------------------
 
         /// <summary>
-        /// Open the session with a CreateObject on the NullServerSession.  The
-        /// attribute set introduces the client the way TIA Portal does: a
-        /// V1-initial CPU only returns ServerSessionVersion, its public-key
-        /// fingerprint and its challenge when the client identifies itself this
-        /// fully, and a minimal request yields an incomplete session.
+        /// Build the CreateObject request that opens the session.  Split out of
+        /// <see cref="CreateSession"/> so the two identification variants can be
+        /// asserted on without a PLC.
         /// </summary>
-        private void CreateSession()
+        /// <param name="seq">The sequence number the frame carries.</param>
+        /// <param name="fullIdentification">
+        /// True for the full TIA-Portal-style attribute set, false for the
+        /// ClientRID attribute alone.
+        /// </param>
+        internal static byte[] BuildCreateSessionRequest(ushort seq, bool fullIdentification)
         {
-            ushort seq = NextSequenceNumber();
-
             var r = new List<byte>();
             r.AddRange(S7Codec.EncodeRequestHeader((ushort)FunctionCode.CreateObject, seq,
                                                    (uint)ObjectId.ObjectNullServerSession, 0x36));
@@ -858,21 +887,33 @@ namespace CsS7CommPlus.V3.Session
             Vlq.AppendUInt32(r, 0);                      // ClassFlags
             Vlq.AppendUInt32(r, 0);                      // AttributeId
 
-            const string clientId = "CsS7CommPlus";
-            AppendWStringAttribute(r, 233, clientId);                       // class name
-            AppendWStringAttribute(r, 289, $"1:::6.0::{clientId}");         // network interface
-            AppendWStringAttribute(r, 296, clientId);                       // project name
-            AppendWStringAttribute(r, 297, string.Empty);
-            AppendWStringAttribute(r, 298, clientId);                       // host name
+            if (!fullIdentification)
+            {
+                // Minimal request: the ClientRID only, matching the reference
+                // driver's SetNullServerSessionData(). Firmware that rejects the
+                // fuller identification below still accepts this.
+                r.Add((byte)ElementId.Attribute);
+                Vlq.AppendUInt32(r, (uint)ObjectId.ServerSessionClientRid);
+                r.Add(0x00); r.Add((byte)DataType.Rid); S7Codec.AppendUInt32(r, 0x80C3C901);
+            }
+            else
+            {
+                const string clientId = "CsS7CommPlus";
+                AppendWStringAttribute(r, 233, clientId);                       // class name
+                AppendWStringAttribute(r, 289, $"1:::6.0::{clientId}");         // network interface
+                AppendWStringAttribute(r, 296, clientId);                       // project name
+                AppendWStringAttribute(r, 297, string.Empty);
+                AppendWStringAttribute(r, 298, clientId);                       // host name
 
-            r.Add((byte)ElementId.Attribute); Vlq.AppendUInt32(r, 299);
-            r.Add(0x00); r.Add((byte)DataType.UDInt); Vlq.AppendUInt32(r, 1);
+                r.Add((byte)ElementId.Attribute); Vlq.AppendUInt32(r, 299);
+                r.Add(0x00); r.Add((byte)DataType.UDInt); Vlq.AppendUInt32(r, 1);
 
-            r.Add((byte)ElementId.Attribute);
-            Vlq.AppendUInt32(r, (uint)ObjectId.ServerSessionClientRid);
-            r.Add(0x00); r.Add((byte)DataType.Rid); S7Codec.AppendUInt32(r, 0x80C3C901);
+                r.Add((byte)ElementId.Attribute);
+                Vlq.AppendUInt32(r, (uint)ObjectId.ServerSessionClientRid);
+                r.Add(0x00); r.Add((byte)DataType.Rid); S7Codec.AppendUInt32(r, 0x80C3C901);
 
-            AppendWStringAttribute(r, 301, string.Empty);
+                AppendWStringAttribute(r, 301, string.Empty);
+            }
 
             // Nested subscription container, with its required class-name attribute
             r.Add((byte)ElementId.StartOfObject);
@@ -886,8 +927,32 @@ namespace CsS7CommPlus.V3.Session
             r.Add((byte)ElementId.TerminatingObject);
             S7Codec.AppendUInt32(r, 0);                  // trailing padding
 
+            return r.ToArray();
+        }
+
+        /// <summary>
+        /// Open the session with a CreateObject on the NullServerSession.  With
+        /// <paramref name="fullIdentification"/> set, the attribute set
+        /// introduces the client the way TIA Portal does; many CPUs return
+        /// ServerSessionVersion, their public-key fingerprint and their
+        /// challenge only for that fuller request.  Other firmware rejects it
+        /// outright - a non-zero return value and no ServerSessionVersion - and
+        /// accepts only the minimal ClientRID-only request the reference driver
+        /// sends, which is what clearing the flag emits.  Both behaviors exist
+        /// in the field, so the connect path tries the full set first and
+        /// retries with the minimal one.
+        /// </summary>
+        /// <param name="fullIdentification">
+        /// True to send the full TIA-Portal-style attribute set, false to send
+        /// the ClientRID attribute alone.
+        /// </param>
+        private void CreateSession(bool fullIdentification = true)
+        {
+            ushort seq = NextSequenceNumber();
+
             // CreateObject always goes out with V1 framing.
-            SendFrame(Protocol.ProtocolVersion.V1, r.ToArray());
+            SendFrame(Protocol.ProtocolVersion.V1,
+                      BuildCreateSessionRequest(seq, fullIdentification));
 
             var response = ReceiveFrameData(out var version);
             if (response.Length < S7Codec.ResponseHeaderLength)

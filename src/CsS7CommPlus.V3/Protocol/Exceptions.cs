@@ -20,6 +20,17 @@ namespace CsS7CommPlus.V3.Protocol
         public S7ConnectionException(string message, Exception inner) : base(message, inner) { }
     }
 
+    /// <summary>
+    /// CreateObject came back without a ServerSessionVersion attribute. Some
+    /// firmware answers the full TIA-Portal-style identification that way;
+    /// the connect path retries with the minimal ClientRID-only request.
+    /// </summary>
+    public class S7MissingSessionVersionException : S7ConnectionException
+    {
+        /// <summary>Create the exception with a message.</summary>
+        public S7MissingSessionVersionException(string message) : base(message) { }
+    }
+
     /// <summary>A frame did not match the protocol the PLC is expected to speak.</summary>
     public class S7ProtocolException : S7Exception
     {
