@@ -145,6 +145,9 @@ namespace CsS7CommPlus.V3.Session
                 throw new ArgumentException("A subscription requires at least one item", nameof(items));
             if (cycleMs < 0)
                 throw new ArgumentOutOfRangeException(nameof(cycleMs), "cycleMs must not be negative");
+            if (creditLimit < -1)
+                throw new ArgumentOutOfRangeException(nameof(creditLimit),
+                    "creditLimit must be -1 (unlimited) or a positive signed 16-bit value");
             if (changeCounter < 1)
                 throw new ArgumentOutOfRangeException(nameof(changeCounter), "changeCounter must be between 1 and 255");
 
@@ -175,6 +178,9 @@ namespace CsS7CommPlus.V3.Session
             AppendAttribute(p, Ids.SubscriptionCycleTime, Scalar(DataType.UDInt, Vlq.EncodeUInt32((uint)cycleMs)));
             AppendAttribute(p, Ids.SubscriptionDisabled, Scalar(DataType.USInt, 0x00));
             AppendAttribute(p, Ids.SubscriptionCount, Scalar(DataType.USInt, 0x00));
+            // Two raw big-endian bytes, which is what DataType.Int is everywhere
+            // in this protocol and what the Python reference sends.  The value
+            // itself is what matters: see DefaultCreditLimit.
             AppendAttribute(p, Ids.SubscriptionCreditLimit,
                             Scalar(DataType.Int, (byte)(creditLimit >> 8), (byte)creditLimit));
             AppendAttribute(p, Ids.SubscriptionTicks, Scalar(DataType.UInt, 0xFF, 0xFF));
@@ -189,17 +195,35 @@ namespace CsS7CommPlus.V3.Session
 
         /// <summary>
         /// Notifications the PLC will send before it waits to be given more.
+        /// <c>-1</c>, the default, asks for unlimited credit, so the CPU never
+        /// stops on its own.
         ///
-        /// The credit limit is flow control: the CPU sends this many
-        /// notifications and then goes quiet -- not an error, and not a closed
-        /// connection, simply nothing more until its credit is replenished.
-        /// Replenishing it is not implemented here, so a caller that needs a
-        /// subscription to run indefinitely re-creates it when the CPU falls
-        /// silent. At the default of 1000 and a 500 ms cycle that is once every
-        /// eight minutes or so; the original value of 10 meant every five
-        /// seconds, which is how this came to light.
+        /// <para>
+        /// The credit limit is flow control: with a positive limit the CPU sends
+        /// that many notifications and then goes quiet -- not an error, and not a
+        /// closed connection, simply nothing more until its credit is
+        /// replenished. Replenishing it is not implemented here, which is why the
+        /// default asks for no limit at all.
+        /// </para>
+        ///
+        /// <para>
+        /// Measured on an S7-1212C FW V4.6 (2026-11-24): a positive limit is
+        /// honored to its <b>low byte only</b>. A limit of 1000 (0x03E8) stops the
+        /// CPU after 232 notifications, and 300 (0x012C) after 44; each
+        /// notification carries a CreditTick counting up to that number. So any
+        /// multiple of 256 asks for a credit of zero and delivers nothing at all,
+        /// with no error. With -1 the CreditTick stays 0 and the notifications do
+        /// not stop: 1,192 of them over 120 s on a 100 ms cycle, no silence.
+        /// Prefer -1; treat a positive value as 8-bit.
+        /// </para>
+        ///
+        /// <para>
+        /// The default used to be 1000, which the subscription therefore lost
+        /// after 232 notifications -- every ~2 minutes on FlynnProbe's 500 ms
+        /// cycle, read as a dropped connection by its watchdog.
+        /// </para>
         /// </summary>
-        public const short DefaultCreditLimit = 1000;
+        public const short DefaultCreditLimit = -1;
 
         /// <summary>Build the payload that deletes one subscription container.</summary>
         public static byte[] BuildDeleteSubscriptionRequest(uint subscriptionId, ProtocolVersion protocolVersion)

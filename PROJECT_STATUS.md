@@ -45,7 +45,7 @@ Python pyS7commplus, and `CsS7CommPlus.V3` is a port of the MIT-licensed
 - Session authentication from HarpoS7 (MIT, NuGet) rather than reimplemented.
 
 ## Tests
-177 passing. The V3 tests assert against vectors produced by the Python
+182 passing. The V3 tests assert against vectors produced by the Python
 implementation for the same inputs: the VLQ forms, the object qualifier, item
 addresses, PValue encode/decode, the vartype and name lists, the symbol-tree
 flattening, the notification parser and the value decoder.
@@ -99,3 +99,21 @@ With the fallback in place, against the same CPU:
 - `SessionKey` now reaches the setup write (the retry fires and the key blob is
   built) and is then refused there, which is the same vestigial-challenge wall
   described above, not the identification problem.
+
+## Fixed 2026-11-24 — the subscription ran out of credit every two minutes
+
+`SubscriptionCodec.DefaultCreditLimit` was 1000, a finite credit, and nothing in
+this library replenishes credit. Worse, the bench CPU honors a positive limit to
+its **low byte only**: 1000 (`0x03E8`) buys 232 notifications, 300 (`0x012C`)
+buys 44, and a multiple of 256 buys none at all. The CPU then simply goes quiet,
+which a client with a watchdog reads as a lost connection — FlynnProbe
+reconnected every 125–128 s, to the second, on its 500 ms cycle.
+
+The default is now `-1`, unlimited, which is what the attribute is for. Measured
+against the same CPU: 1,192 notifications over 120 s on a 100 ms cycle with no
+silence and `CreditTick` constant at 0, where the old default stopped at 232
+after 28 s. The encoding was never wrong — two raw big-endian bytes under a
+`DataType.Int` scalar, byte-identical to the Python reference — so the value was
+the whole defect. `V3SubscriptionCreditTests` now pins both the encoding and the
+unlimited default; nothing covered this attribute before, which is how it
+shipped.

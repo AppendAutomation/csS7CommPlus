@@ -206,6 +206,35 @@ The protocol also has a per-reference trigger mode (attribute 1005) that this
 backend does not set, so the PLC's default applies. Whether it offers a true
 unsampled on-change mode is untested.
 
+### Notification credit: ask for unlimited, or the CPU stops
+
+`SubscriptionCreditLimit` (attribute 1053) is flow control, encoded as a signed
+16-bit value — two raw big-endian bytes under a `DataType.Int` scalar, as the
+Python reference sends it. `-1` means unlimited, and
+`SubscriptionCodec.DefaultCreditLimit` is `-1` for that reason: nothing here
+replenishes credit, so a subscription given a finite one simply dies.
+
+Measured on the bench S7-1212C FW V4.6 on 2026-11-24, counting notifications:
+
+| `creditLimit` | hex | notifications received | `CreditTick` |
+|---|---|---|---|
+| 1000 | `0x03E8` | 232 (`= 0xE8`) | counts 1…232 |
+| 300 | `0x012C` | 44 (`= 0x2C`) | counts 1…44 |
+| -1 | `0xFFFF` | 1,192 in 120 s at a 100 ms cycle, no silence | constant 0 |
+
+So **a positive limit is honored to its low byte only**, and any multiple of 256
+asks for a credit of zero — a subscription that delivers nothing at all, with no
+error. When the credit runs out the CPU simply goes quiet: no error, no closed
+connection, and a client reading that as a dead link reconnects in a loop. That
+was FLYNN's two-minute churn: the old default of 1000 on a 500 ms cycle stopped
+after 232 notifications, 116 s, plus a 2 s watchdog.
+
+Encoding the limit as a VLQ instead makes the symptom disappear, but it is not
+the fix: `Vlq.EncodeInt32(1000)` is `0x87 0x68`, which the CPU reads back as a
+negative 16-bit value and therefore as unlimited. That is why such a run
+overshoots the requested credit and reports `CreditTick` 0 — it is the unlimited
+path, reached by accident.
+
 ## Measured on the bench S7-1212C
 
 Over the LAN from this repository, 2026-10-01:

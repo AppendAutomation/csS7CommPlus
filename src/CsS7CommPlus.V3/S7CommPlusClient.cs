@@ -655,8 +655,11 @@ namespace CsS7CommPlus.V3
         /// <param name="items">The symbols to watch.</param>
         /// <param name="cycleMs">Sampling cycle in milliseconds.</param>
         /// <param name="creditLimit">
-        /// How many notifications the PLC may send before the client acknowledges.
-        /// Ten is the value real S7-1500 CPUs accept.
+        /// How many notifications the PLC may send before it waits to be given
+        /// more credit. The default of -1 asks for no limit, so the CPU keeps
+        /// sending; a positive value is honored to its low byte only, and the
+        /// subscription then falls silent. See
+        /// <see cref="SubscriptionCodec.DefaultCreditLimit"/>.
         /// </param>
         /// <returns>The subscription id the PLC assigned.</returns>
         public uint CreateSubscription(IReadOnlyList<SubscriptionItem> items, int cycleMs = 100,
